@@ -1,6 +1,6 @@
 use serde::Serialize;
 use std::collections::BTreeMap;
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -18,6 +18,7 @@ pub(crate) struct Snapshot {
     pub(crate) zram: Option<Zram>,
     pub(crate) vmstat: BTreeMap<String, u64>,
     pub(crate) cgroup_v2: Option<CgroupSnapshot>,
+    pub(crate) cgroup_capabilities: CgroupCapabilities,
     pub(crate) workloads: Vec<WorkloadSnapshot>,
 }
 
@@ -74,6 +75,17 @@ pub(crate) struct CgroupSnapshot {
 }
 
 #[derive(Debug, Serialize)]
+pub(crate) struct CgroupCapabilities {
+    pub(crate) mount_detected: bool,
+    pub(crate) current_path: Option<String>,
+    pub(crate) controllers_available_to_children: Vec<String>,
+    pub(crate) controllers_enabled_for_children: Vec<String>,
+    pub(crate) memory_accounting_available: bool,
+    pub(crate) memory_controller_enabled_for_children: bool,
+    pub(crate) subtree_control_write_open: bool,
+}
+
+#[derive(Debug, Serialize)]
 pub(crate) struct WorkloadSnapshot {
     pub(crate) slice: String,
     pub(crate) name: String,
@@ -92,7 +104,41 @@ impl Snapshot {
     pub fn to_human(&self) -> String {
         let mut out = String::new();
         out.push_str("Nexus Resource Governor — read-only Linux snapshot\n");
-        out.push_str("No resource controls were changed.\n\n");
+        out.push_str("No resource controls were changed.\n");
+        out.push_str(&format!(
+            "cgroup v2: mount={} memory_accounting={} memory_for_children={} subtree_control_write_open={}\n",
+            self.cgroup_capabilities.mount_detected,
+            self.cgroup_capabilities.memory_accounting_available,
+            self.cgroup_capabilities.memory_controller_enabled_for_children,
+            self.cgroup_capabilities.subtree_control_write_open
+        ));
+        if !self
+            .cgroup_capabilities
+            .controllers_available_to_children
+            .is_empty()
+        {
+            out.push_str(&format!(
+                "cgroup controllers available to children: {}\n",
+                self.cgroup_capabilities
+                    .controllers_available_to_children
+                    .join(" ")
+            ));
+        }
+        out.push_str(&format!(
+            "cgroup controllers enabled for children: {}\n",
+            if self
+                .cgroup_capabilities
+                .controllers_enabled_for_children
+                .is_empty()
+            {
+                "none".to_owned()
+            } else {
+                self.cgroup_capabilities
+                    .controllers_enabled_for_children
+                    .join(" ")
+            }
+        ));
+        out.push('\n');
         push_metric(&mut out, "Physical RAM total", self.memory.total_bytes);
         push_metric(
             &mut out,
@@ -224,7 +270,7 @@ pub fn collect_snapshot() -> io::Result<Snapshot> {
         .as_millis();
 
     Ok(Snapshot {
-        schema_version: 1,
+        schema_version: 2,
         timestamp_unix_ms,
         platform: "linux",
         memory,
@@ -232,6 +278,7 @@ pub fn collect_snapshot() -> io::Result<Snapshot> {
         zram: read_zram("zram0").ok().flatten(),
         vmstat: read_vmstat()?,
         cgroup_v2: read_current_cgroup().ok().flatten(),
+        cgroup_capabilities: read_cgroup_capabilities(),
         workloads: read_workloads().unwrap_or_default(),
     })
 }
@@ -342,6 +389,45 @@ fn current_cgroup_relative_path() -> io::Result<Option<PathBuf>> {
         }
     });
     Ok(relative.and_then(|path| safe_cgroup_relative_path(&path)))
+}
+
+fn parse_controller_list(input: &str) -> Vec<String> {
+    input
+        .split_whitespace()
+        .map(|controller| controller.trim_start_matches(['+', '-']).to_owned())
+        .filter(|controller| !controller.is_empty())
+        .collect()
+}
+
+fn read_cgroup_capabilities() -> CgroupCapabilities {
+    let current_path = current_cgroup_relative_path().ok().flatten();
+    let base = current_path
+        .as_ref()
+        .map(|path| Path::new(CGROUP_ROOT).join(path))
+        .unwrap_or_else(|| PathBuf::from(CGROUP_ROOT));
+    let mount_detected = Path::new(CGROUP_ROOT).join("cgroup.controllers").is_file();
+    let controllers_available_to_children = fs::read_to_string(base.join("cgroup.controllers"))
+        .map(|contents| parse_controller_list(&contents))
+        .unwrap_or_default();
+    let controllers_enabled_for_children = fs::read_to_string(base.join("cgroup.subtree_control"))
+        .map(|contents| parse_controller_list(&contents))
+        .unwrap_or_default();
+    let subtree_control_write_open = OpenOptions::new()
+        .write(true)
+        .open(base.join("cgroup.subtree_control"))
+        .is_ok();
+
+    CgroupCapabilities {
+        mount_detected,
+        current_path: current_path.map(|path| format!("/{}", path.display())),
+        controllers_available_to_children,
+        memory_controller_enabled_for_children: controllers_enabled_for_children
+            .iter()
+            .any(|controller| controller == "memory"),
+        controllers_enabled_for_children,
+        memory_accounting_available: base.join("memory.current").is_file(),
+        subtree_control_write_open,
+    }
 }
 
 fn read_current_cgroup() -> io::Result<Option<CgroupSnapshot>> {
@@ -493,6 +579,18 @@ mod tests {
     }
 
     #[test]
+    fn parses_cgroup_controller_lists() {
+        assert_eq!(
+            parse_controller_list("cpu memory pids\n"),
+            vec!["cpu", "memory", "pids"]
+        );
+        assert_eq!(
+            parse_controller_list("+cpu -io memory"),
+            vec!["cpu", "io", "memory"]
+        );
+    }
+
+    #[test]
     fn parses_cgroup_key_values() {
         let parsed = parse_key_values("low 1\nhigh 2\nmax 3\n");
         assert_eq!(parsed.get("high"), Some(&2));
@@ -528,5 +626,3 @@ mod tests {
         assert_eq!(fields.get("total"), Some(&"12345"));
     }
 }
-
-[executed on device: archlinux (bc227e4e-b47b-4157-8834-d4e1828760c0)]

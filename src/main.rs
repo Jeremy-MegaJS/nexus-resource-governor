@@ -113,5 +113,3 @@ fn main() {
     eprintln!("The Linux telemetry backend is not available on this platform yet.");
     std::process::exit(2);
 }
-
-[executed on device: archlinux (bc227e4e-b47b-4157-8834-d4e1828760c0)]

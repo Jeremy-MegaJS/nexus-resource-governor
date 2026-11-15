@@ -226,4 +226,8 @@ The next implementation must replace this advisory plan with a transaction-like 
 
 The OOM guard is an early-warning and coordination layer, not a replacement for the Linux kernel OOM killer. It should intervene before the kernel reaches OOM where telemetry allows, while leaving the kernel as the final safety mechanism.
 
-[executed on device: archlinux (bc227e4e-b47b-4157-8834-d4e1828760c0)]
+## 14. cgroup v2 capability discovery
+
+The Linux snapshot reports the controllers visible to the current cgroup, the controllers enabled for its children, whether memory accounting files are present, and whether cgroup.subtree_control can be opened for writing by the current process. The write-open check does not write to the control file and does not change system state.
+
+This is a capability signal, not proof that systemd delegated a complete writable subtree: creating child cgroups, enabling controllers, and managing processes require additional permissions and hierarchy checks. Enforcement must revalidate those permissions at the point of use and must never infer delegation from controller visibility alone. The snapshot schema is version 2 because the capability report is a new top-level field.

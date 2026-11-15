@@ -154,7 +154,7 @@ mod tests {
     fn fixture(available: u64) -> Snapshot {
         use crate::linux::{Memory, Pressure, PsiLine};
         Snapshot {
-            schema_version: 1,
+            schema_version: 2,
             timestamp_unix_ms: 0,
             platform: "linux",
             memory: Memory {
@@ -188,6 +188,15 @@ mod tests {
             zram: None,
             vmstat: Default::default(),
             cgroup_v2: None,
+            cgroup_capabilities: crate::linux::CgroupCapabilities {
+                mount_detected: false,
+                current_path: None,
+                controllers_available_to_children: vec![],
+                controllers_enabled_for_children: vec![],
+                memory_accounting_available: false,
+                memory_controller_enabled_for_children: false,
+                subtree_control_write_open: false,
+            },
             workloads: vec![],
         }
     }
@@ -207,5 +216,3 @@ mod tests {
         );
     }
 }
-
-[executed on device: archlinux (bc227e4e-b47b-4157-8834-d4e1828760c0)]

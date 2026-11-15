@@ -99,6 +99,7 @@ The first implementation is a read-only Rust CLI. It currently samples:
 - ZRAM compression and physical-memory accounting from sysfs.
 - Selected paging and reclaim counters from /proc/vmstat.
 - The collector process's current cgroup v2 memory counters.
+- cgroup v2 controller availability, child-controller enablement, and a non-mutating write-open probe for the current cgroup (not a guarantee of systemd delegation).
 - Per-workload cgroup memory, CPU, process-count, and I/O counters from user application, session, and background slices.
 
 The watch mode emits one JSON snapshot per line and flushes each sample, making it useful for correlating resource pressure with freezes. The policy evaluator adds an early OOM-risk guard with NORMAL / WATCH / PRESSURE / CRITICAL states. Rescue Mode can generate a dry-run plan for a target application and requested temporary headroom, ranking other user applications that could be offered for save-and-close/pause.
@@ -128,7 +129,3 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and [docs/ROADMAP.md](docs/ROAD
 ## License
 
 License not selected yet.
-
-
-
-[executed on device: archlinux (bc227e4e-b47b-4157-8834-d4e1828760c0)]

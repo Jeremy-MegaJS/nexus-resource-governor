@@ -15,7 +15,7 @@ The project is in the requirements and architecture phase. The order prioritizes
 - [x] Add read-only Linux snapshot CLI for physical memory, swap, zram, memory PSI, selected vmstat counters, and current cgroup v2 metrics.
 - [x] Add parser tests and safe cgroup-path validation.
 - [x] Add JSONL watch mode with per-sample flush for pressure/freeze correlation.
-- [ ] Detect cgroup v2 controllers and delegation across the system.
+- [x] Detect cgroup v2 controllers, child-controller enablement, and current-cgroup subtree-control write access (read-only probe; delegation is not assumed).
 - [x] Collect per-workload memory, CPU, process-count, and I/O counters from user cgroup slices.
 - [ ] Discover workloads from systemd cgroups and process trees.
 - [ ] Attribute memory and CPU to applications without double counting.
@@ -74,7 +74,3 @@ The project is in the requirements and architecture phase. The order prioritizes
 - Killing applications automatically to meet a free-memory number.
 - Claiming generic save-state support for arbitrary applications.
 - Applying kernel, registry, or global scheduler tweaks without evidence.
-
-
-
-[executed on device: archlinux (bc227e4e-b47b-4157-8834-d4e1828760c0)]
