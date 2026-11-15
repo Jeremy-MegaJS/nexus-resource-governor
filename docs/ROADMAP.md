@@ -1,0 +1,70 @@
+# Nexus Resource Governor — Roadmap
+
+The project is in the requirements and architecture phase. The order prioritizes trustworthy measurement and safe recovery before enforcement.
+
+## Phase 0 — Requirements and architecture
+- [x] Define Linux-first, Windows-planned strategy.
+- [x] Define shared policy engine and native backend boundary.
+- [x] Define physical-memory reserve as an adaptive target, not a hard reservation.
+- [x] Separate physical RAM from swap/zram accounting.
+- [x] Define graduated responses and no-silent-kill safety rule.
+- [ ] Select UI toolkit and IPC protocol.
+- [ ] Define configuration schema and compatibility rules.
+
+## Phase 1 — Read-only Linux telemetry
+- [ ] Detect cgroup v2 controllers and delegation.
+- [ ] Collect global memory, swap, zram, PSI, CPU, and I/O metrics.
+- [ ] Discover workloads from systemd cgroups and process trees.
+- [ ] Attribute memory and CPU to applications without double counting.
+- [ ] Provide a stable sampling API and bounded local history.
+- [ ] Validate metrics against system tools under normal and stressed workloads.
+
+**Exit criteria:** NRG explains which workloads consume resources and whether the system is actually under pressure, without changing system state.
+
+## Phase 2 — Policy engine and simulator
+- [ ] Define portable observations, workload identities, budgets, and backend capabilities.
+- [ ] Implement deterministic policy evaluation.
+- [ ] Add normal, gaming/performance, and battery-conscious profiles.
+- [ ] Implement admission-control simulation.
+- [ ] Add hysteresis, cooldowns, and degraded-mode behavior.
+- [ ] Replay captured telemetry to test decisions without enforcement.
+
+**Exit criteria:** the same input snapshot and policy always produce the same explainable decision.
+
+## Phase 3 — Linux controlled enforcement
+- [ ] Create managed workload scopes.
+- [ ] Add reversible CPU and I/O prioritization.
+- [ ] Add memory.high support with explicit opt-in and rollback.
+- [ ] Add optional hard ceilings only after safety testing.
+- [ ] Implement action ownership, expiry, crash recovery, and audit log.
+- [ ] Test under synthetic pressure and real desktop workloads.
+
+**Exit criteria:** every intervention is bounded, observable, reversible, and tested against failure cases.
+
+## Phase 4 — Desktop experience
+- [ ] System tray and live resource overview.
+- [ ] Per-application budgets and profiles.
+- [ ] Clear explanations and confirmation prompts.
+- [ ] Temporary overrides and one-click restoration.
+- [ ] Accessibility, localization, and startup behavior.
+
+## Phase 5 — Windows backend
+- [ ] Implement Windows telemetry provider.
+- [ ] Implement Job Object workload management.
+- [ ] Map shared policy capabilities to Windows-native controls.
+- [ ] Add Windows-specific integration and recovery tests.
+- [ ] Document controls that differ from Linux.
+
+## Phase 6 — Advanced capabilities
+- [ ] Application adapters for graceful save/close.
+- [ ] GPU and integrated-GPU memory telemetry where attribution is reliable.
+- [ ] Network monitoring and optional shaping.
+- [ ] Workload recommendations based on historical patterns.
+- [ ] Exportable diagnostics and privacy-conscious telemetry.
+
+## Non-goals for early releases
+- Replacing the operating system's memory manager.
+- Guaranteeing that memory utilization never reaches 100%.
+- Killing applications automatically to meet a free-memory number.
+- Claiming generic save-state support for arbitrary applications.
+- Applying kernel, registry, or global scheduler tweaks without evidence.
