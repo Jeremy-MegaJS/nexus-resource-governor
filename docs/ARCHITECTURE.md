@@ -1,0 +1,216 @@
+# Nexus Resource Governor — Architecture
+
+**Status:** Proposed architecture. Enforcement remains disabled until the relevant backend is implemented and tested.
+
+## 1. Product boundary
+
+NRG is a user-space resource policy and control layer. The operating system remains responsible for low-level memory management, scheduling, paging, and process execution.
+
+NRG has five responsibilities:
+1. Observe system and workload state.
+2. Translate user intent into resource policies.
+3. Predict whether a new workload fits the current policy.
+4. Apply supported, reversible controls when pressure rises.
+5. Explain decisions and recover from temporary interventions.
+
+It must not promise that the machine can never reach 100% memory utilization. It should reduce the probability and impact of sustained resource pressure.
+
+## 2. High-level components
+
+    Desktop UI
+        | typed local IPC
+    Policy Engine
+        | shared rules, admission, pressure stages, explanations
+        +---------------------------+
+        |                           |
+    Linux Backend               Windows Backend
+    cgroup v2                   Job Objects
+    PSI / procfs                Process and memory APIs
+    systemd integration         Windows telemetry
+        |                           |
+        +-------------+-------------+
+                      |
+              Telemetry + Audit Store
+
+These are logical boundaries, not a commitment to a specific UI toolkit or IPC protocol.
+
+## 3. Shared policy model
+
+The shared engine must not contain Linux paths, Windows handles, or platform-specific kernel details. It operates on normalized observations and backend capabilities.
+
+### Observation
+
+A snapshot should include:
+- Timestamp and sampling interval.
+- Physical memory total, available, and reclaimable estimates.
+- Swap capacity and usage, including compressed swap when exposed.
+- Memory pressure and stall metrics.
+- CPU utilization and pressure.
+- Storage I/O utilization and pressure when available.
+- Workload identity, process tree, and per-workload counters.
+- Backend health and metric confidence.
+
+Metrics retain their source and confidence. Missing telemetry is unavailable, not zero.
+
+### Workload identity
+
+A workload is a logical application instance, not merely a process name. It may include:
+- A root process and descendants.
+- One or more cgroups or Windows Job Objects.
+- Launch origin and executable identity.
+- User-selected classification (game, browser, editor, background task).
+- Optional application adapter.
+
+Names alone are not a safe identity: unrelated processes can share an executable name.
+
+### Budget
+
+A policy distinguishes:
+- **Target:** preferred operating range.
+- **Warning threshold:** point where the user is informed.
+- **Soft limit:** point where reversible pressure controls may begin.
+- **Hard limit:** optional enforcement ceiling, disabled by default.
+- **System reserve target:** desired available physical-memory margin.
+- **Override:** temporary user-approved exception with expiry.
+
+RAM and swap/zram are separate budgets. CPU and I/O policies are separate dimensions.
+
+## 4. Dynamic system reserve
+
+The initial product target is approximately **2 GiB of available physical RAM during normal desktop use** on the reference 8 GiB machine. This is a policy target, not memory preallocated or permanently withheld from applications.
+
+The reserve adapts to:
+- Total installed memory.
+- Desktop and system baseline.
+- Current memory pressure and reclaimability.
+- Active workload profile.
+- User overrides.
+
+A gaming/performance profile may lower the reserve target and allow a game to use more memory. The governor must not enforce a fixed 2 GiB ceiling on games.
+
+The first implementation measures before it enforces. Reserve values are tuned from telemetry, not treated as universal defaults.
+
+## 5. Admission control
+
+Admission control is reliable only when NRG controls or participates in workload launch.
+
+Initial supported path:
+1. User launches an application through NRG or an NRG-managed launcher entry.
+2. Backend estimates current pressure and the application's configured budget.
+3. Policy engine returns allow, allow-with-warning, or require-confirmation.
+4. Backend starts the process inside its workload container where supported.
+5. Monitor tracks the workload and applies its policy.
+
+NRG must not claim that it can intercept every application launch. Existing processes may be adopted only where the platform supports safe assignment and required permissions are available.
+
+The estimate is advisory: applications can allocate unpredictable amounts after launch.
+
+## 6. Graduated pressure controller
+
+The controller is a state machine with hysteresis, not a single threshold trigger.
+
+Suggested states:
+- NORMAL
+- WATCH
+- PRESSURE
+- CONTAINED
+- RECOVERY
+- DEGRADED
+
+Transitions use sustained measurements and separate enter/exit thresholds to prevent rapid oscillation.
+
+Response order:
+1. Notify and explain.
+2. Identify the workload contributing to pressure.
+3. Apply soft, reversible controls supported by the backend.
+4. Offer a temporary budget change or prioritization decision.
+5. Ask before suspending, closing, or terminating a workload.
+6. Never kill a process unless the user explicitly enabled a policy that permits it.
+
+A hard cgroup memory limit can trigger OOM handling inside a workload. It is an advanced opt-in feature, not the default pressure response.
+
+## 7. Linux backend
+
+### Monitoring
+- cgroup v2 memory.current, memory.stat, memory.events, and memory.pressure.
+- memory.swap.current and memory.swap.max where available.
+- /proc/pressure/memory, /proc/pressure/cpu, and /proc/pressure/io.
+- /proc/meminfo, /proc/vmstat, and zram sysfs statistics.
+- Process metadata and systemd user-slice hierarchy.
+
+The backend detects whether cgroup v2 controllers are available and delegated. It must not assume every distribution exposes identical permissions.
+
+### Enforcement
+Potential controls, enabled only after validation:
+- memory.high for pressure throttling/reclaim.
+- memory.max only for explicit hard limits.
+- memory.swap.max as a separate swap constraint.
+- CPU weights and quotas.
+- I/O weights and limits.
+
+Prefer systemd-managed scopes/slices where feasible so ownership and cleanup are explicit. Do not modify global kernel settings as a routine per-app action.
+
+### Safety
+- Run monitoring unprivileged where possible.
+- Use a narrowly scoped privileged helper only for operations that require it.
+- Never run the whole desktop UI or remote-control service as root.
+- Track every applied value and restore it on policy removal, shutdown, or backend recovery.
+
+## 8. Windows backend
+
+The Windows backend implements the same policy interface using native APIs:
+- Job Objects for grouping a process tree and applying supported job limits.
+- Process and system memory APIs for telemetry.
+- CPU and I/O controls where Windows exposes reliable equivalents.
+- Native notifications and startup integration.
+
+Some controls and telemetry will not map one-to-one between Windows and Linux. The shared engine exposes backend capabilities so the UI does not imply unsupported controls exist.
+
+NRG should launch managed workloads into a Job Object from process creation where possible. Assigning arbitrary existing processes may fail because of permissions, existing job membership, or process state.
+
+## 9. Persistence and audit
+
+Persist:
+- User profiles and workload policies.
+- Backend capability discovery.
+- Recent state transitions.
+- Actions taken, previous values, and restoration status.
+- User overrides and expiry.
+- Errors and degraded-mode events.
+
+Avoid storing high-frequency raw telemetry indefinitely. Use bounded retention and aggregate older samples.
+
+Every action record should answer: **what changed, why, on which workload, under which policy, when, and how will it be restored?**
+
+## 10. Application adapters and progress preservation
+
+NRG cannot generically save an application's unsaved state. An adapter may integrate with an application's documented API, save mechanism, or graceful shutdown protocol.
+
+Without an adapter, NRG can still:
+- Warn the user.
+- Reduce priority or apply reversible limits.
+- Request that the user save work.
+- Suspend a process only where supported and safe.
+- Avoid forced termination.
+
+An adapter declares its capabilities. NRG must never report a save as successful unless the application confirms it.
+
+## 11. Security model
+
+- UI-to-engine communication uses authenticated local IPC and strict message schemas.
+- Policy evaluation is separate from privileged enforcement.
+- Privileged operations are allowlisted, validated, logged, and narrowly scoped.
+- No arbitrary shell command or root command is exposed to models, plugins, or UI inputs.
+- Configuration and audit data are owned by the current user, with integrity checks for privileged state.
+- Backend failure triggers safe restoration or an explicit degraded state.
+
+## 12. Technology direction
+
+Proposed direction:
+- **Core and policy engine:** Rust, for memory safety and a portable shared codebase.
+- **Platform backends:** Rust modules with small native FFI boundaries.
+- **UI:** choose after validating desktop integration and accessibility requirements; keep it separate from policy logic.
+- **IPC:** versioned local protocol with explicit capability negotiation.
+- **Tests:** deterministic policy tests, backend integration tests, stress tests, and fault-injection tests.
+
+This is a proposed stack, not a locked implementation decision.
