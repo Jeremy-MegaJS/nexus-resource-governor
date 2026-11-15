@@ -9,83 +9,83 @@ const MEMINFO: &str = "/proc/meminfo";
 const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 
 #[derive(Debug, Serialize)]
-pub struct Snapshot {
-    schema_version: u32,
-    timestamp_unix_ms: u128,
-    platform: &'static str,
-    memory: Memory,
-    pressure: Pressure,
-    zram: Option<Zram>,
-    vmstat: BTreeMap<String, u64>,
-    cgroup_v2: Option<CgroupSnapshot>,
-    workloads: Vec<WorkloadSnapshot>,
+pub(crate) struct Snapshot {
+    pub(crate) schema_version: u32,
+    pub(crate) timestamp_unix_ms: u128,
+    pub(crate) platform: &'static str,
+    pub(crate) memory: Memory,
+    pub(crate) pressure: Pressure,
+    pub(crate) zram: Option<Zram>,
+    pub(crate) vmstat: BTreeMap<String, u64>,
+    pub(crate) cgroup_v2: Option<CgroupSnapshot>,
+    pub(crate) workloads: Vec<WorkloadSnapshot>,
 }
 
 #[derive(Debug, Serialize)]
-struct Memory {
-    total_bytes: Option<u64>,
-    available_bytes: Option<u64>,
-    free_bytes: Option<u64>,
-    buffers_bytes: Option<u64>,
-    cached_bytes: Option<u64>,
-    reclaimable_slab_bytes: Option<u64>,
-    unreclaimable_slab_bytes: Option<u64>,
-    swap_total_bytes: Option<u64>,
-    swap_free_bytes: Option<u64>,
-    swap_used_bytes: Option<u64>,
-    committed_bytes: Option<u64>,
-    commit_limit_bytes: Option<u64>,
+pub(crate) struct Memory {
+    pub(crate) total_bytes: Option<u64>,
+    pub(crate) available_bytes: Option<u64>,
+    pub(crate) free_bytes: Option<u64>,
+    pub(crate) buffers_bytes: Option<u64>,
+    pub(crate) cached_bytes: Option<u64>,
+    pub(crate) reclaimable_slab_bytes: Option<u64>,
+    pub(crate) unreclaimable_slab_bytes: Option<u64>,
+    pub(crate) swap_total_bytes: Option<u64>,
+    pub(crate) swap_free_bytes: Option<u64>,
+    pub(crate) swap_used_bytes: Option<u64>,
+    pub(crate) committed_bytes: Option<u64>,
+    pub(crate) commit_limit_bytes: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
-struct Pressure {
-    some: Option<PsiLine>,
-    full: Option<PsiLine>,
+pub(crate) struct Pressure {
+    pub(crate) some: Option<PsiLine>,
+    pub(crate) full: Option<PsiLine>,
 }
 
 #[derive(Debug, Serialize)]
-struct PsiLine {
-    avg10: Option<f64>,
-    avg60: Option<f64>,
-    avg300: Option<f64>,
-    total_us: Option<u64>,
+pub(crate) struct PsiLine {
+    pub(crate) avg10: Option<f64>,
+    pub(crate) avg60: Option<f64>,
+    pub(crate) avg300: Option<f64>,
+    pub(crate) total_us: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
-struct Zram {
-    device: String,
-    disk_size_bytes: Option<u64>,
-    original_data_bytes: Option<u64>,
-    compressed_data_bytes: Option<u64>,
-    memory_used_bytes: Option<u64>,
-    payload_compression_ratio: Option<f64>,
-    effective_compression_ratio: Option<f64>,
+pub(crate) struct Zram {
+    pub(crate) device: String,
+    pub(crate) disk_size_bytes: Option<u64>,
+    pub(crate) original_data_bytes: Option<u64>,
+    pub(crate) compressed_data_bytes: Option<u64>,
+    pub(crate) memory_used_bytes: Option<u64>,
+    pub(crate) payload_compression_ratio: Option<f64>,
+    pub(crate) effective_compression_ratio: Option<f64>,
 }
 
 #[derive(Debug, Serialize)]
-struct CgroupSnapshot {
-    path: String,
-    memory_current_bytes: Option<u64>,
-    memory_high_limit: Option<String>,
-    memory_max_limit: Option<String>,
-    memory_swap_current_bytes: Option<u64>,
-    memory_swap_max_limit: Option<String>,
-    memory_events: BTreeMap<String, u64>,
+pub(crate) struct CgroupSnapshot {
+    pub(crate) path: String,
+    pub(crate) memory_current_bytes: Option<u64>,
+    pub(crate) memory_high_limit: Option<String>,
+    pub(crate) memory_max_limit: Option<String>,
+    pub(crate) memory_swap_current_bytes: Option<u64>,
+    pub(crate) memory_swap_max_limit: Option<String>,
+    pub(crate) memory_events: BTreeMap<String, u64>,
 }
 
 #[derive(Debug, Serialize)]
-struct WorkloadSnapshot {
-    slice: String,
-    name: String,
-    path: String,
-    memory_current_bytes: Option<u64>,
-    memory_anon_bytes: Option<u64>,
-    memory_file_bytes: Option<u64>,
-    cpu_usage_usec: Option<u64>,
-    pids_current: Option<u64>,
-    io_read_bytes: u64,
-    io_write_bytes: u64,
-    memory_events: BTreeMap<String, u64>,
+pub(crate) struct WorkloadSnapshot {
+    pub(crate) slice: String,
+    pub(crate) name: String,
+    pub(crate) path: String,
+    pub(crate) memory_current_bytes: Option<u64>,
+    pub(crate) memory_anon_bytes: Option<u64>,
+    pub(crate) memory_file_bytes: Option<u64>,
+    pub(crate) cpu_usage_usec: Option<u64>,
+    pub(crate) pids_current: Option<u64>,
+    pub(crate) io_read_bytes: u64,
+    pub(crate) io_write_bytes: u64,
+    pub(crate) memory_events: BTreeMap<String, u64>,
 }
 
 impl Snapshot {
@@ -528,3 +528,5 @@ mod tests {
         assert_eq!(fields.get("total"), Some(&"12345"));
     }
 }
+
+[executed on device: archlinux (bc227e4e-b47b-4157-8834-d4e1828760c0)]
