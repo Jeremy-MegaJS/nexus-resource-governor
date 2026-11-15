@@ -109,6 +109,7 @@ pub(crate) struct ProcessSnapshot {
     pub(crate) pid: u32,
     pub(crate) comm: String,
     pub(crate) executable: Option<String>,
+    pub(crate) executable_path: Option<String>,
     pub(crate) parent_pid: Option<u32>,
     pub(crate) parent_comm: Option<String>,
     pub(crate) parent_in_workload: Option<bool>,
@@ -333,7 +334,7 @@ pub fn collect_snapshot() -> io::Result<Snapshot> {
         .as_millis();
 
     Ok(Snapshot {
-        schema_version: 5,
+        schema_version: 6,
         timestamp_unix_ms,
         platform: "linux",
         memory,
@@ -690,12 +691,13 @@ fn correlate_processes(workloads: &mut [WorkloadSnapshot]) {
         let comm = fs::read_to_string(process_dir.join("comm"))
             .map(|value| value.trim().to_owned())
             .unwrap_or_else(|_| "unknown".to_owned());
-        let executable = fs::read_link(process_dir.join("exe"))
-            .ok()
-            .and_then(|path| {
-                path.file_name()
-                    .map(|name| name.to_string_lossy().into_owned())
-            });
+        let executable_link = fs::read_link(process_dir.join("exe")).ok();
+        let executable = executable_link.as_ref().and_then(|path| {
+            path.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        });
+        let executable_path = executable_link
+            .map(|path| path.to_string_lossy().chars().take(512).collect::<String>());
         let rss_estimate_bytes = fs::read_to_string(process_dir.join("status"))
             .ok()
             .and_then(|status| parse_process_rss_bytes(&status));
@@ -722,6 +724,7 @@ fn correlate_processes(workloads: &mut [WorkloadSnapshot]) {
             pid,
             comm,
             executable,
+            executable_path,
             parent_pid,
             parent_comm,
             parent_in_workload,
@@ -781,12 +784,13 @@ fn read_process_snapshot_for_workload(
     let comm = fs::read_to_string(process_dir.join("comm"))
         .ok()
         .map(|value| value.trim().to_owned())?;
-    let executable = fs::read_link(process_dir.join("exe"))
-        .ok()
-        .and_then(|path| {
-            path.file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-        });
+    let executable_link = fs::read_link(process_dir.join("exe")).ok();
+    let executable = executable_link.as_ref().and_then(|path| {
+        path.file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+    });
+    let executable_path =
+        executable_link.map(|path| path.to_string_lossy().chars().take(512).collect::<String>());
     let rss_estimate_bytes = fs::read_to_string(process_dir.join("status"))
         .ok()
         .and_then(|status| parse_process_rss_bytes(&status));
@@ -809,6 +813,7 @@ fn read_process_snapshot_for_workload(
         pid,
         comm,
         executable,
+        executable_path,
         parent_pid,
         parent_comm,
         parent_in_workload,
@@ -937,6 +942,7 @@ mod tests {
             pid,
             comm: format!("process-{pid}"),
             executable: None,
+            executable_path: None,
             parent_pid,
             parent_comm: None,
             parent_in_workload: parent_pid.map(|_| true),

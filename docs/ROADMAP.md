@@ -22,7 +22,8 @@ The project is in the requirements and architecture phase. The order prioritizes
 - [x] Correlate top-level workload cgroups with observed `/proc` process membership and bounded per-process RSS diagnostics (not additive).
 - [x] Capture PPID and parent cgroup relationship for observed processes.
 - [x] Add a bounded (32-node) ancestor-closed process graph rooted at the five highest-RSS processes, with same-workload parent validation and truncation metadata.
-- [ ] Improve application identity beyond cgroup membership and executable basename.
+- [x] Expose a bounded `/proc/PID/exe` target path alongside executable basename as an additional identity hint; do not collect command-line arguments.
+- [ ] Improve application identity beyond cgroup membership and executable metadata using confidence-scored, non-secret signals.
 - [ ] Provide a stable sampling API and bounded local history.
 - [ ] Validate metrics against system tools under normal and stressed workloads.
 

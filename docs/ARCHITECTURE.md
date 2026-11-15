@@ -136,7 +136,7 @@ A hard cgroup memory limit can trigger OOM handling inside a workload. It is an 
 - memory.swap.current and memory.swap.max where available.
 - /proc/pressure/memory, /proc/pressure/cpu, and /proc/pressure/io.
 - /proc/meminfo, /proc/vmstat, and zram sysfs statistics.
-- Process metadata and systemd user-slice hierarchy.
+- Process metadata and systemd user-slice hierarchy. The read-only process sample exposes both executable basename and a bounded (512-character) `/proc/PID/exe` target path as identity hints; neither is treated as a unique application identity. Command-line arguments are intentionally not collected because they may contain secrets.
 
 The backend detects whether cgroup v2 controllers are available and delegated. It must not assume every distribution exposes identical permissions.
 

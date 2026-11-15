@@ -154,7 +154,7 @@ mod tests {
     fn fixture(available: u64) -> Snapshot {
         use crate::linux::{Memory, Pressure, PsiLine};
         Snapshot {
-            schema_version: 5,
+            schema_version: 6,
             timestamp_unix_ms: 0,
             platform: "linux",
             memory: Memory {
