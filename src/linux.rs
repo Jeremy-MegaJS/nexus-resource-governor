@@ -478,6 +478,25 @@ fn user_manager_root(path: &Path) -> Option<PathBuf> {
     Some(components[..=index].iter().collect())
 }
 
+fn decode_systemd_escape(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if index + 3 < bytes.len() && bytes[index] == b'\\' && bytes[index + 1] == b'x' {
+            let hex = std::str::from_utf8(&bytes[index + 2..index + 4]).unwrap_or("");
+            if let Ok(value) = u8::from_str_radix(hex, 16) {
+                decoded.push(value);
+                index += 4;
+                continue;
+            }
+        }
+        decoded.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8_lossy(&decoded).into_owned()
+}
+
 fn read_workloads() -> io::Result<Vec<WorkloadSnapshot>> {
     let Some(current_path) = current_cgroup_relative_path()? else {
         return Ok(Vec::new());
@@ -498,7 +517,8 @@ fn read_workloads() -> io::Result<Vec<WorkloadSnapshot>> {
             if !entry.file_type()?.is_dir() {
                 continue;
             }
-            let name = entry.file_name().to_string_lossy().into_owned();
+            let raw_name = entry.file_name().to_string_lossy().into_owned();
+            let name = decode_systemd_escape(&raw_name);
             let path = entry.path();
             if !path.join("memory.current").exists() {
                 continue;
@@ -622,6 +642,22 @@ mod tests {
     fn accepts_absolute_kernel_cgroup_path_as_relative_to_mount() {
         let path = safe_cgroup_relative_path("/user.slice/user-1000.slice").unwrap();
         assert_eq!(path, PathBuf::from("user.slice/user-1000.slice"));
+    }
+
+    #[test]
+    fn decodes_systemd_hex_escaped_unit_names() {
+        assert_eq!(
+            decode_systemd_escape(r"app-Remote\x2dDesktop\x2dCommander.service"),
+            "app-Remote-Desktop-Commander.service"
+        );
+        assert_eq!(
+            decode_systemd_escape(r"app-demo\x40scope"),
+            "app-demo@scope"
+        );
+        assert_eq!(
+            decode_systemd_escape("plain-name.service"),
+            "plain-name.service"
+        );
     }
 
     #[test]

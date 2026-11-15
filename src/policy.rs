@@ -209,6 +209,42 @@ mod tests {
     }
 
     #[test]
+    fn rescue_plan_excludes_decoded_protected_workloads() {
+        use crate::linux::WorkloadSnapshot;
+        let mut snapshot = fixture(3 * GIB);
+        let workload = |slice: &str, name: &str, memory: u64| WorkloadSnapshot {
+            slice: slice.to_owned(),
+            name: name.to_owned(),
+            path: format!("/sys/fs/cgroup/user.slice/{slice}/{name}"),
+            memory_current_bytes: Some(memory),
+            memory_anon_bytes: None,
+            memory_file_bytes: None,
+            cpu_usage_usec: None,
+            pids_current: Some(10),
+            io_read_bytes: 0,
+            io_write_bytes: 0,
+            memory_events: Default::default(),
+        };
+        snapshot.workloads = vec![
+            workload(
+                "app.slice",
+                "app-Remote-Desktop-Commander@session.service",
+                600 * MIB,
+            ),
+            workload("session.slice", "plasma-kwin_wayland.service", 500 * MIB),
+            workload("app.slice", "app-editor.service", 400 * MIB),
+        ];
+        let plan = rescue_plan(&snapshot, "editor", 512);
+        assert_eq!(plan.candidates.len(), 0);
+        assert!(
+            !plan
+                .candidates
+                .iter()
+                .any(|candidate| candidate.workload.contains("Remote-Desktop-Commander"))
+        );
+    }
+
+    #[test]
     fn normal_memory_does_not_trigger_pressure() {
         assert_eq!(
             evaluate(&fixture(3 * GIB)).oom_guard.state,
