@@ -17,8 +17,9 @@ The project is in the requirements and architecture phase. The order prioritizes
 - [x] Add JSONL watch mode with per-sample flush for pressure/freeze correlation.
 - [x] Detect cgroup v2 controllers, child-controller enablement, and current-cgroup subtree-control write access (read-only probe; delegation is not assumed).
 - [x] Collect per-workload memory, CPU, process-count, and I/O counters from user cgroup slices.
-- [ ] Discover workloads from systemd cgroups and process trees.
-- [ ] Attribute memory and CPU to applications without double counting.
+- [x] Discover workloads from the per-user systemd cgroup hierarchy, independent of whether NRG runs in `app.slice`.
+- [x] Use top-level workload cgroups as accounting boundaries; document that `memory.current` includes descendants and must not be summed with nested child cgroups.
+- [ ] Correlate cgroup workloads with process trees and application identities where reliable.
 - [ ] Provide a stable sampling API and bounded local history.
 - [ ] Validate metrics against system tools under normal and stressed workloads.
 

@@ -455,12 +455,34 @@ fn read_current_cgroup() -> io::Result<Option<CgroupSnapshot>> {
     }))
 }
 
+fn user_manager_root(path: &Path) -> Option<PathBuf> {
+    let components: Vec<_> = path
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(value) => Some(value.to_os_string()),
+            _ => None,
+        })
+        .collect();
+    let index = components
+        .iter()
+        .position(|part| {
+            let name = part.to_string_lossy();
+            name.starts_with("user@") && name.ends_with(".service")
+        })
+        .or_else(|| {
+            components.iter().position(|part| {
+                let name = part.to_string_lossy();
+                name.starts_with("user-") && name.ends_with(".slice")
+            })
+        })?;
+    Some(components[..=index].iter().collect())
+}
+
 fn read_workloads() -> io::Result<Vec<WorkloadSnapshot>> {
     let Some(current_path) = current_cgroup_relative_path()? else {
         return Ok(Vec::new());
     };
-    let current = current_path.to_string_lossy();
-    let Some((user_root, _)) = current.split_once("/app.slice/") else {
+    let Some(user_root) = user_manager_root(&current_path) else {
         return Ok(Vec::new());
     };
     let user_root = Path::new(CGROUP_ROOT).join(user_root);
@@ -600,6 +622,28 @@ mod tests {
     fn accepts_absolute_kernel_cgroup_path_as_relative_to_mount() {
         let path = safe_cgroup_relative_path("/user.slice/user-1000.slice").unwrap();
         assert_eq!(path, PathBuf::from("user.slice/user-1000.slice"));
+    }
+
+    #[test]
+    fn finds_user_manager_root_without_assuming_app_slice() {
+        let app_path =
+            Path::new("/user.slice/user-1000.slice/user@1000.service/app.slice/app-demo.scope");
+        assert_eq!(
+            user_manager_root(app_path),
+            Some(PathBuf::from(
+                "user.slice/user-1000.slice/user@1000.service"
+            ))
+        );
+        let session_path = Path::new("/user.slice/user-1000.slice/session-2.scope");
+        assert_eq!(
+            user_manager_root(session_path),
+            Some(PathBuf::from("user.slice/user-1000.slice"))
+        );
+    }
+
+    #[test]
+    fn rejects_paths_without_a_user_manager_or_user_slice() {
+        assert!(user_manager_root(Path::new("/system.slice/sshd.service")).is_none());
     }
 
     #[test]

@@ -231,3 +231,12 @@ The OOM guard is an early-warning and coordination layer, not a replacement for 
 The Linux snapshot reports the controllers visible to the current cgroup, the controllers enabled for its children, whether memory accounting files are present, and whether cgroup.subtree_control can be opened for writing by the current process. The write-open check does not write to the control file and does not change system state.
 
 This is a capability signal, not proof that systemd delegated a complete writable subtree: creating child cgroups, enabling controllers, and managing processes require additional permissions and hierarchy checks. Enforcement must revalidate those permissions at the point of use and must never infer delegation from controller visibility alone. The snapshot schema is version 2 because the capability report is a new top-level field.
+
+
+## 15. Workload hierarchy and memory attribution
+
+Workload discovery derives the per-user systemd manager root from the current cgroup path. It does not assume that NRG itself runs under `app.slice`; it can also discover workloads when launched from a session or another user-owned cgroup.
+
+For each supported user slice (`app.slice`, `session.slice`, and `background.slice`), NRG records immediate child cgroups as workload boundaries. A cgroup v2 `memory.current` value includes the memory charged to that cgroup and its descendants. Therefore NRG must not emit and sum both a parent workload and its nested child cgroups as independent consumers. The current snapshot deliberately uses the top-level child as the accounting boundary and preserves its full cgroup path as the workload identity.
+
+This is cgroup-level attribution, not proof that every byte belongs exclusively to one GUI application: shared services, delegated sub-cgroups, and processes outside these user slices need separate attribution rules. Missing or inaccessible cgroups remain unavailable rather than being estimated. Discovery remains read-only.
