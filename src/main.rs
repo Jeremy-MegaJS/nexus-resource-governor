@@ -4,6 +4,8 @@ use std::time::Duration;
 
 #[cfg(target_os = "linux")]
 mod linux;
+#[cfg(target_os = "linux")]
+mod policy;
 
 #[cfg(target_os = "linux")]
 fn main() {
@@ -12,8 +14,43 @@ fn main() {
 
     if mode == "--help" || mode == "-h" {
         println!(
-            "nrg-agent [--json|--human|--watch [INTERVAL_MS]]\n\nRead-only Linux resource telemetry. No system settings are changed.\n--watch emits newline-delimited JSON until interrupted (default 1000 ms)."
+            "nrg-agent [--json|--human|--watch [INTERVAL_MS]|--policy|--rescue-plan TARGET EXTRA_MIB]\n\nRead-only Linux telemetry and dry-run policy evaluation. No system settings are changed.\n--policy evaluates the early OOM guard.\n--rescue-plan creates a user-action plan; it never pauses or closes apps."
         );
+        return;
+    }
+
+    if mode == "--policy" || mode == "--rescue-plan" {
+        let snapshot = match linux::collect_snapshot() {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                eprintln!("Could not collect resource snapshot: {error}");
+                std::process::exit(1);
+            }
+        };
+        if mode == "--policy" {
+            let report = policy::evaluate(&snapshot);
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&report).expect("policy report serialization")
+            );
+        } else {
+            let target = args.get(1).unwrap_or_else(|| {
+                eprintln!("Usage: nrg-agent --rescue-plan TARGET EXTRA_MIB");
+                std::process::exit(2);
+            });
+            let extra = match args.get(2).and_then(|v| v.parse::<u64>().ok()) {
+                Some(value) if value > 0 => value,
+                _ => {
+                    eprintln!("EXTRA_MIB must be a positive integer");
+                    std::process::exit(2);
+                }
+            };
+            let plan = policy::rescue_plan(&snapshot, target, extra);
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&plan).expect("rescue plan serialization")
+            );
+        }
         return;
     }
 
@@ -28,7 +65,6 @@ fn main() {
             },
             None => 1_000,
         };
-
         let stdout = io::stdout();
         let mut output = stdout.lock();
         loop {
@@ -77,3 +113,5 @@ fn main() {
     eprintln!("The Linux telemetry backend is not available on this platform yet.");
     std::process::exit(2);
 }
+
+[executed on device: archlinux (bc227e4e-b47b-4157-8834-d4e1828760c0)]
