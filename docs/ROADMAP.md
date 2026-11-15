@@ -25,14 +25,17 @@ The project is in the requirements and architecture phase. The order prioritizes
 **Exit criteria:** NRG explains which workloads consume resources and whether the system is actually under pressure, without changing system state.
 
 ## Phase 2 — Policy engine and simulator
-- [ ] Define portable observations, workload identities, budgets, and backend capabilities.
-- [ ] Implement deterministic policy evaluation.
+- [x] Define a first portable policy input using normalized Linux telemetry.
+- [x] Implement deterministic early OOM-risk evaluation and dry-run Rescue Mode planning.
+- [ ] Define persistent workload identities, configurable budgets, and backend capabilities.
 - [ ] Add normal, gaming/performance, and battery-conscious profiles.
 - [ ] Implement admission-control simulation.
 - [ ] Add hysteresis, cooldowns, and degraded-mode behavior.
 - [ ] Replay captured telemetry to test decisions without enforcement.
+- [ ] Add per-workload soft/warning budgets and expiring temporary overrides.
+- [ ] Add explicit save/close adapter protocol and user-confirmed Rescue Mode workflow.
 
-**Exit criteria:** the same input snapshot and policy always produce the same explainable decision.
+**Exit criteria:** the same input snapshot and policy always produce the same explainable decision. Current first pass: deterministic OOM guard and dry-run rescue planner; no enforcement.
 
 ## Phase 3 — Linux controlled enforcement
 - [ ] Create managed workload scopes.
@@ -73,3 +76,5 @@ The project is in the requirements and architecture phase. The order prioritizes
 - Applying kernel, registry, or global scheduler tweaks without evidence.
 
 
+
+[executed on device: archlinux (bc227e4e-b47b-4157-8834-d4e1828760c0)]
