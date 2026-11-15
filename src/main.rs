@@ -35,4 +35,3 @@ fn main() {
     eprintln!("The Linux telemetry backend is not available on this platform yet.");
     std::process::exit(2);
 }
-
