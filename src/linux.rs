@@ -78,17 +78,35 @@ impl Snapshot {
         out.push_str("Nexus Resource Governor — read-only Linux snapshot\n");
         out.push_str("No resource controls were changed.\n\n");
         push_metric(&mut out, "Physical RAM total", self.memory.total_bytes);
-        push_metric(&mut out, "Physical RAM available", self.memory.available_bytes);
+        push_metric(
+            &mut out,
+            "Physical RAM available",
+            self.memory.available_bytes,
+        );
         push_metric(&mut out, "Physical RAM free", self.memory.free_bytes);
         push_metric(&mut out, "Swap used", self.memory.swap_used_bytes);
         if let Some(zram) = &self.zram {
-            push_metric(&mut out, &format!("{} compressed data", zram.device), zram.compressed_data_bytes);
-            push_metric(&mut out, &format!("{} physical memory used", zram.device), zram.memory_used_bytes);
+            push_metric(
+                &mut out,
+                &format!("{} compressed data", zram.device),
+                zram.compressed_data_bytes,
+            );
+            push_metric(
+                &mut out,
+                &format!("{} physical memory used", zram.device),
+                zram.memory_used_bytes,
+            );
             if let Some(ratio) = zram.payload_compression_ratio {
-                out.push_str(&format!("{} payload compression: {:.2}:1\n", zram.device, ratio));
+                out.push_str(&format!(
+                    "{} payload compression: {:.2}:1\n",
+                    zram.device, ratio
+                ));
             }
             if let Some(ratio) = zram.effective_compression_ratio {
-                out.push_str(&format!("{} effective compression: {:.2}:1\n", zram.device, ratio));
+                out.push_str(&format!(
+                    "{} effective compression: {:.2}:1\n",
+                    zram.device, ratio
+                ));
             }
         } else {
             out.push_str("ZRAM: not detected or unavailable\n");
@@ -111,8 +129,15 @@ impl Snapshot {
         }
         if let Some(cgroup) = &self.cgroup_v2 {
             out.push_str(&format!("Current cgroup: {}\n", cgroup.path));
-            push_metric(&mut out, "Cgroup memory.current", cgroup.memory_current_bytes);
-            out.push_str(&format!("Cgroup memory.high: {}\n", cgroup.memory_high_limit.as_deref().unwrap_or("unavailable")));
+            push_metric(
+                &mut out,
+                "Cgroup memory.current",
+                cgroup.memory_current_bytes,
+            );
+            out.push_str(&format!(
+                "Cgroup memory.high: {}\n",
+                cgroup.memory_high_limit.as_deref().unwrap_or("unavailable")
+            ));
         } else {
             out.push_str("Current cgroup: unavailable (not cgroup v2 or inaccessible)\n");
         }
@@ -122,7 +147,11 @@ impl Snapshot {
 
 fn push_metric(out: &mut String, label: &str, value: Option<u64>) {
     match value {
-        Some(bytes) => out.push_str(&format!("{label}: {} ({:.2} GiB)\n", bytes, bytes as f64 / 1_073_741_824.0)),
+        Some(bytes) => out.push_str(&format!(
+            "{label}: {} ({:.2} GiB)\n",
+            bytes,
+            bytes as f64 / 1_073_741_824.0
+        )),
         None => out.push_str(&format!("{label}: unavailable\n")),
     }
 }
@@ -151,8 +180,12 @@ pub fn collect_snapshot() -> io::Result<Snapshot> {
     };
 
     let pressure = Pressure {
-        some: read_psi_line("/proc/pressure/memory", "some").ok().flatten(),
-        full: read_psi_line("/proc/pressure/memory", "full").ok().flatten(),
+        some: read_psi_line("/proc/pressure/memory", "some")
+            .ok()
+            .flatten(),
+        full: read_psi_line("/proc/pressure/memory", "full")
+            .ok()
+            .flatten(),
     };
 
     let timestamp_unix_ms = SystemTime::now()
@@ -173,11 +206,14 @@ pub fn collect_snapshot() -> io::Result<Snapshot> {
 }
 
 fn parse_meminfo(input: &str) -> BTreeMap<String, u64> {
-    input.lines().filter_map(|line| {
-        let (key, value) = line.split_once(':')?;
-        let number = value.split_whitespace().next()?.parse::<u64>().ok()?;
-        Some((key.to_owned(), number))
-    }).collect()
+    input
+        .lines()
+        .filter_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            let number = value.split_whitespace().next()?.parse::<u64>().ok()?;
+            Some((key.to_owned(), number))
+        })
+        .collect()
 }
 
 fn kib_to_bytes(value: Option<u64>) -> Option<u64> {
@@ -213,7 +249,10 @@ fn read_zram(device: &str) -> io::Result<Option<Zram>> {
         return Ok(None);
     }
     let stats = fs::read_to_string(base.join("mm_stat"))?;
-    let values: Vec<u64> = stats.split_whitespace().filter_map(|v| v.parse().ok()).collect();
+    let values: Vec<u64> = stats
+        .split_whitespace()
+        .filter_map(|v| v.parse().ok())
+        .collect();
     let original = values.first().copied();
     let compressed = values.get(1).copied();
     let memory_used = values.get(2).copied();
@@ -238,33 +277,46 @@ fn read_zram(device: &str) -> io::Result<Option<Zram>> {
 
 fn read_vmstat() -> io::Result<BTreeMap<String, u64>> {
     const SELECTED: &[&str] = &[
-        "pgmajfault", "pswpin", "pswpout", "allocstall",
-        "pgscan_kswapd", "pgscan_direct", "pgsteal_kswapd", "pgsteal_direct",
+        "pgmajfault",
+        "pswpin",
+        "pswpout",
+        "allocstall",
+        "pgscan_kswapd",
+        "pgscan_direct",
+        "pgsteal_kswapd",
+        "pgsteal_direct",
     ];
     let contents = fs::read_to_string("/proc/vmstat")?;
-    Ok(contents.lines().filter_map(|line| {
-        let mut parts = line.split_whitespace();
-        let key = parts.next()?;
-        if !SELECTED.contains(&key) {
-            return None;
-        }
-        Some((key.to_owned(), parts.next()?.parse().ok()?))
-    }).collect())
+    Ok(contents
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            let key = parts.next()?;
+            if !SELECTED.contains(&key) {
+                return None;
+            }
+            Some((key.to_owned(), parts.next()?.parse().ok()?))
+        })
+        .collect())
 }
 
 fn read_current_cgroup() -> io::Result<Option<CgroupSnapshot>> {
     let contents = fs::read_to_string("/proc/self/cgroup")?;
     let relative = contents.lines().find_map(|line| {
         let mut parts = line.splitn(3, ':');
-        if parts.next()? == "0" && parts.next()? == "" {
+        if parts.next()? == "0" && parts.next()?.is_empty() {
             Some(parts.next()?.to_owned())
         } else {
             None
         }
     });
-    let Some(relative) = relative else { return Ok(None) };
+    let Some(relative) = relative else {
+        return Ok(None);
+    };
 
-    let Some(relative_path) = safe_cgroup_relative_path(&relative) else { return Ok(None) };
+    let Some(relative_path) = safe_cgroup_relative_path(&relative) else {
+        return Ok(None);
+    };
     let base = Path::new(CGROUP_ROOT).join(relative_path);
     if !base.join("memory.current").exists() {
         return Ok(None);
@@ -286,7 +338,10 @@ fn read_current_cgroup() -> io::Result<Option<CgroupSnapshot>> {
 }
 
 fn read_u64(path: PathBuf) -> io::Result<u64> {
-    fs::read_to_string(path)?.trim().parse().map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid numeric value"))
+    fs::read_to_string(path)?
+        .trim()
+        .parse()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid numeric value"))
 }
 
 fn read_limit(path: PathBuf) -> io::Result<String> {
@@ -295,7 +350,12 @@ fn read_limit(path: PathBuf) -> io::Result<String> {
 
 fn safe_cgroup_relative_path(path: &str) -> Option<PathBuf> {
     let relative = Path::new(path.trim_start_matches('/'));
-    if relative.components().any(|part| matches!(part, Component::ParentDir | Component::RootDir | Component::Prefix(_))) {
+    if relative.components().any(|part| {
+        matches!(
+            part,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        )
+    }) {
         None
     } else {
         Some(relative.to_path_buf())
@@ -303,10 +363,13 @@ fn safe_cgroup_relative_path(path: &str) -> Option<PathBuf> {
 }
 
 fn parse_key_values(input: &str) -> BTreeMap<String, u64> {
-    input.lines().filter_map(|line| {
-        let mut parts = line.split_whitespace();
-        Some((parts.next()?.to_owned(), parts.next()?.parse().ok()?))
-    }).collect()
+    input
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            Some((parts.next()?.to_owned(), parts.next()?.parse().ok()?))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -317,7 +380,10 @@ mod tests {
     fn parses_meminfo_values_in_kib() {
         let parsed = parse_meminfo("MemTotal:       8000000 kB\nMemAvailable:  2000000 kB\n");
         assert_eq!(parsed.get("MemTotal"), Some(&8_000_000));
-        assert_eq!(kib_to_bytes(parsed.get("MemAvailable").copied()), Some(2_048_000_000));
+        assert_eq!(
+            kib_to_bytes(parsed.get("MemAvailable").copied()),
+            Some(2_048_000_000)
+        );
     }
 
     #[test]
