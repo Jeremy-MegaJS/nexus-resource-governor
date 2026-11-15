@@ -57,7 +57,8 @@ struct Zram {
     original_data_bytes: Option<u64>,
     compressed_data_bytes: Option<u64>,
     memory_used_bytes: Option<u64>,
-    compression_ratio: Option<f64>,
+    payload_compression_ratio: Option<f64>,
+    effective_compression_ratio: Option<f64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -213,8 +214,12 @@ fn read_zram(device: &str) -> io::Result<Option<Zram>> {
     let original = values.first().copied();
     let compressed = values.get(1).copied();
     let memory_used = values.get(2).copied();
-    let ratio = match (original, compressed) {
+    let payload_ratio = match (original, compressed) {
         (Some(orig), Some(comp)) if comp > 0 => Some(orig as f64 / comp as f64),
+        _ => None,
+    };
+    let effective_ratio = match (original, memory_used) {
+        (Some(orig), Some(used)) if used > 0 => Some(orig as f64 / used as f64),
         _ => None,
     };
     Ok(Some(Zram {
@@ -223,7 +228,8 @@ fn read_zram(device: &str) -> io::Result<Option<Zram>> {
         original_data_bytes: original,
         compressed_data_bytes: compressed,
         memory_used_bytes: memory_used,
-        compression_ratio: ratio,
+        payload_compression_ratio: payload_ratio,
+        effective_compression_ratio: effective_ratio,
     }))
 }
 
@@ -255,7 +261,7 @@ fn read_current_cgroup() -> io::Result<Option<CgroupSnapshot>> {
     });
     let Some(relative) = relative else { return Ok(None) };
 
-    let relative_path = Path::new(&relative);
+    let relative_path = Path::new(relative.trim_start_matches('/'));
     if relative_path.components().any(|part| matches!(part, Component::ParentDir | Component::RootDir | Component::Prefix(_))) {
         return Ok(None);
     }
