@@ -21,7 +21,8 @@ The project is in the requirements and architecture phase. The order prioritizes
 - [x] Use top-level workload cgroups as accounting boundaries; document that `memory.current` includes descendants and must not be summed with nested child cgroups.
 - [x] Correlate top-level workload cgroups with observed `/proc` process membership and bounded per-process RSS diagnostics (not additive).
 - [x] Capture PPID and parent cgroup relationship for observed processes.
-- [ ] Build complete bounded process trees and stronger application identity beyond cgroup membership.
+- [x] Add a bounded (32-node) parent-linked process graph sample per workload, with deterministic RSS selection, explicit missing-parent edges, and truncation metadata.
+- [ ] Build ancestor-closed process trees and stronger application identity beyond cgroup membership; current graph is a bounded RSS-selected sample, not a complete tree.
 - [ ] Provide a stable sampling API and bounded local history.
 - [ ] Validate metrics against system tools under normal and stressed workloads.
 
