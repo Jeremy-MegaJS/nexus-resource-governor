@@ -14,6 +14,7 @@ The project is in the requirements and architecture phase. The order prioritizes
 ## Phase 1 — Read-only Linux telemetry
 - [x] Add read-only Linux snapshot CLI for physical memory, swap, zram, memory PSI, selected vmstat counters, and current cgroup v2 metrics.
 - [x] Add parser tests and safe cgroup-path validation.
+- [x] Add JSONL watch mode with per-sample flush for pressure/freeze correlation.
 - [ ] Detect cgroup v2 controllers and delegation across the system.
 - [ ] Collect per-workload memory, CPU, and I/O metrics.
 - [ ] Discover workloads from systemd cgroups and process trees.
@@ -70,3 +71,4 @@ The project is in the requirements and architecture phase. The order prioritizes
 - Killing applications automatically to meet a free-memory number.
 - Claiming generic save-state support for arbitrary applications.
 - Applying kernel, registry, or global scheduler tweaks without evidence.
+
