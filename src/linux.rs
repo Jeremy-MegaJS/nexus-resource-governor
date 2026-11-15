@@ -158,12 +158,12 @@ impl Snapshot {
             out.push_str("Current cgroup: unavailable (not cgroup v2 or inaccessible)\n");
         }
         if !self.workloads.is_empty() {
-            out.push_str("Top user workloads (cgroup memory):\\n");
+            out.push_str("Top user workloads (cgroup memory):\n");
             for workload in self.workloads.iter().take(8) {
                 let memory_gib =
                     workload.memory_current_bytes.unwrap_or(0) as f64 / 1_073_741_824.0;
                 out.push_str(&format!(
-                    "  {}/{}: {:.2} GiB, {} tasks\\n",
+                    "  {}/{}: {:.2} GiB, {} tasks\n",
                     workload.slice,
                     workload.name,
                     memory_gib,
@@ -512,7 +512,7 @@ mod tests {
     #[test]
     fn sums_io_stat_bytes_across_devices() {
         let (read, write) = parse_io_stat(
-            "8:0 rbytes=1024 wbytes=2048 rios=1 wios=2\\n259:0 rbytes=4096 wbytes=8192 rios=3 wios=4\\n",
+            "8:0 rbytes=1024 wbytes=2048 rios=1 wios=2\n259:0 rbytes=4096 wbytes=8192 rios=3 wios=4\n",
         );
         assert_eq!(read, 5120);
         assert_eq!(write, 10240);
@@ -528,5 +528,6 @@ mod tests {
         assert_eq!(fields.get("total"), Some(&"12345"));
     }
 }
+
 
 
