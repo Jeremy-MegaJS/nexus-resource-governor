@@ -34,9 +34,11 @@ fn main() {
         loop {
             match linux::collect_snapshot() {
                 Ok(snapshot) => {
-                    if let Err(error) = serde_json::to_writer(&mut output, &snapshot)
-                        .and_then(|_| output.write_all(b"\n").map_err(serde_json::Error::io))
-                    {
+                    if let Err(error) = serde_json::to_writer(&mut output, &snapshot) {
+                        eprintln!("Could not serialize telemetry sample: {error}");
+                        std::process::exit(1);
+                    }
+                    if let Err(error) = output.write_all(b"\n") {
                         eprintln!("Could not write telemetry sample: {error}");
                         std::process::exit(1);
                     }
