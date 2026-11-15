@@ -16,7 +16,7 @@ The project is in the requirements and architecture phase. The order prioritizes
 - [x] Add parser tests and safe cgroup-path validation.
 - [x] Add JSONL watch mode with per-sample flush for pressure/freeze correlation.
 - [ ] Detect cgroup v2 controllers and delegation across the system.
-- [ ] Collect per-workload memory, CPU, and I/O metrics.
+- [x] Collect per-workload memory, CPU, process-count, and I/O counters from user cgroup slices.
 - [ ] Discover workloads from systemd cgroups and process trees.
 - [ ] Attribute memory and CPU to applications without double counting.
 - [ ] Provide a stable sampling API and bounded local history.
@@ -71,4 +71,5 @@ The project is in the requirements and architecture phase. The order prioritizes
 - Killing applications automatically to meet a free-memory number.
 - Claiming generic save-state support for arbitrary applications.
 - Applying kernel, registry, or global scheduler tweaks without evidence.
+
 
