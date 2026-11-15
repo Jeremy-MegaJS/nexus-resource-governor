@@ -100,7 +100,7 @@ The first implementation is a read-only Rust CLI. It currently samples:
 - Selected paging and reclaim counters from /proc/vmstat.
 - The collector process's current cgroup v2 memory counters.
 
-It does not enforce budgets, change cgroups, reserve RAM, or manage other applications yet.
+The watch mode emits one JSON snapshot per line and flushes each sample, making it useful for correlating resource pressure with freezes. It does not enforce budgets, change cgroups, reserve RAM, or manage other applications yet.
 
 Build and run on Linux:
 
@@ -108,6 +108,7 @@ Build and run on Linux:
 cargo test
 cargo run -- --human
 cargo run -- --json
+cargo run -- --watch 1000 >> nrg-session.jsonl
 ```
 
 ## Development
@@ -117,3 +118,4 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and [docs/ROADMAP.md](docs/ROAD
 ## License
 
 License not selected yet.
+
