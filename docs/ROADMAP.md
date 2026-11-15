@@ -12,8 +12,10 @@ The project is in the requirements and architecture phase. The order prioritizes
 - [ ] Define configuration schema and compatibility rules.
 
 ## Phase 1 — Read-only Linux telemetry
-- [ ] Detect cgroup v2 controllers and delegation.
-- [ ] Collect global memory, swap, zram, PSI, CPU, and I/O metrics.
+- [x] Add read-only Linux snapshot CLI for physical memory, swap, zram, memory PSI, selected vmstat counters, and current cgroup v2 metrics.
+- [x] Add parser tests and safe cgroup-path validation.
+- [ ] Detect cgroup v2 controllers and delegation across the system.
+- [ ] Collect per-workload memory, CPU, and I/O metrics.
 - [ ] Discover workloads from systemd cgroups and process trees.
 - [ ] Attribute memory and CPU to applications without double counting.
 - [ ] Provide a stable sampling API and bounded local history.
