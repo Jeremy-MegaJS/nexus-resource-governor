@@ -18,6 +18,7 @@ pub struct Snapshot {
     zram: Option<Zram>,
     vmstat: BTreeMap<String, u64>,
     cgroup_v2: Option<CgroupSnapshot>,
+    workloads: Vec<WorkloadSnapshot>,
 }
 
 #[derive(Debug, Serialize)]
@@ -69,6 +70,21 @@ struct CgroupSnapshot {
     memory_max_limit: Option<String>,
     memory_swap_current_bytes: Option<u64>,
     memory_swap_max_limit: Option<String>,
+    memory_events: BTreeMap<String, u64>,
+}
+
+#[derive(Debug, Serialize)]
+struct WorkloadSnapshot {
+    slice: String,
+    name: String,
+    path: String,
+    memory_current_bytes: Option<u64>,
+    memory_anon_bytes: Option<u64>,
+    memory_file_bytes: Option<u64>,
+    cpu_usage_usec: Option<u64>,
+    pids_current: Option<u64>,
+    io_read_bytes: u64,
+    io_write_bytes: u64,
     memory_events: BTreeMap<String, u64>,
 }
 
@@ -202,6 +218,7 @@ pub fn collect_snapshot() -> io::Result<Snapshot> {
         zram: read_zram("zram0").ok().flatten(),
         vmstat: read_vmstat()?,
         cgroup_v2: read_current_cgroup().ok().flatten(),
+        workloads: read_workloads().unwrap_or_default(),
     })
 }
 
@@ -300,7 +317,7 @@ fn read_vmstat() -> io::Result<BTreeMap<String, u64>> {
         .collect())
 }
 
-fn read_current_cgroup() -> io::Result<Option<CgroupSnapshot>> {
+fn current_cgroup_relative_path() -> io::Result<Option<PathBuf>> {
     let contents = fs::read_to_string("/proc/self/cgroup")?;
     let relative = contents.lines().find_map(|line| {
         let mut parts = line.splitn(3, ':');
@@ -310,14 +327,15 @@ fn read_current_cgroup() -> io::Result<Option<CgroupSnapshot>> {
             None
         }
     });
-    let Some(relative) = relative else {
-        return Ok(None);
-    };
+    Ok(relative.and_then(|path| safe_cgroup_relative_path(&path)))
+}
 
-    let Some(relative_path) = safe_cgroup_relative_path(&relative) else {
+fn read_current_cgroup() -> io::Result<Option<CgroupSnapshot>> {
+    let Some(relative_path) = current_cgroup_relative_path()? else {
         return Ok(None);
     };
-    let base = Path::new(CGROUP_ROOT).join(relative_path);
+    let relative = format!("/{}", relative_path.display());
+    let base = Path::new(CGROUP_ROOT).join(&relative_path);
     if !base.join("memory.current").exists() {
         return Ok(None);
     }
@@ -335,6 +353,65 @@ fn read_current_cgroup() -> io::Result<Option<CgroupSnapshot>> {
         memory_swap_max_limit: read_limit(base.join("memory.swap.max")).ok(),
         memory_events,
     }))
+}
+
+fn read_workloads() -> io::Result<Vec<WorkloadSnapshot>> {
+    let Some(current_path) = current_cgroup_relative_path()? else {
+        return Ok(Vec::new());
+    };
+    let current = current_path.to_string_lossy();
+    let Some((user_root, _)) = current.split_once("/app.slice/") else {
+        return Ok(Vec::new());
+    };
+    let user_root = Path::new(CGROUP_ROOT).join(user_root);
+    let mut workloads = Vec::new();
+
+    for slice in ["app.slice", "session.slice", "background.slice"] {
+        let slice_path = user_root.join(slice);
+        if !slice_path.is_dir() {
+            continue;
+        }
+        for entry in fs::read_dir(&slice_path)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let path = entry.path();
+            if !path.join("memory.current").exists() {
+                continue;
+            }
+            let memory_stat = fs::read_to_string(path.join("memory.stat"))
+                .map(|text| parse_key_values(&text))
+                .unwrap_or_default();
+            let cpu_stat = fs::read_to_string(path.join("cpu.stat"))
+                .map(|text| parse_key_values(&text))
+                .unwrap_or_default();
+            let memory_events = fs::read_to_string(path.join("memory.events"))
+                .map(|text| parse_key_values(&text))
+                .unwrap_or_default();
+            let (io_read_bytes, io_write_bytes) = fs::read_to_string(path.join("io.stat"))
+                .map(|text| parse_io_stat(&text))
+                .unwrap_or_default();
+
+            workloads.push(WorkloadSnapshot {
+                slice: slice.to_owned(),
+                name,
+                path: path.to_string_lossy().into_owned(),
+                memory_current_bytes: read_u64(path.join("memory.current")).ok(),
+                memory_anon_bytes: memory_stat.get("anon").copied(),
+                memory_file_bytes: memory_stat.get("file").copied(),
+                cpu_usage_usec: cpu_stat.get("usage_usec").copied(),
+                pids_current: read_u64(path.join("pids.current")).ok(),
+                io_read_bytes,
+                io_write_bytes,
+                memory_events,
+            });
+        }
+    }
+
+    workloads.sort_by_key(|item| std::cmp::Reverse(item.memory_current_bytes.unwrap_or(0)));
+    Ok(workloads)
 }
 
 fn read_u64(path: PathBuf) -> io::Result<u64> {
@@ -360,6 +437,21 @@ fn safe_cgroup_relative_path(path: &str) -> Option<PathBuf> {
     } else {
         Some(relative.to_path_buf())
     }
+}
+
+fn parse_io_stat(input: &str) -> (u64, u64) {
+    let mut read_bytes = 0_u64;
+    let mut write_bytes = 0_u64;
+    for line in input.lines() {
+        for field in line.split_whitespace().skip(1) {
+            if let Some(value) = field.strip_prefix("rbytes=") {
+                read_bytes = read_bytes.saturating_add(value.parse().unwrap_or(0));
+            } else if let Some(value) = field.strip_prefix("wbytes=") {
+                write_bytes = write_bytes.saturating_add(value.parse().unwrap_or(0));
+            }
+        }
+    }
+    (read_bytes, write_bytes)
 }
 
 fn parse_key_values(input: &str) -> BTreeMap<String, u64> {
@@ -404,6 +496,15 @@ mod tests {
     }
 
     #[test]
+    fn sums_io_stat_bytes_across_devices() {
+        let (read, write) = parse_io_stat(
+            "8:0 rbytes=1024 wbytes=2048 rios=1 wios=2\\n259:0 rbytes=4096 wbytes=8192 rios=3 wios=4\\n",
+        );
+        assert_eq!(read, 5120);
+        assert_eq!(write, 10240);
+    }
+
+    #[test]
     fn parses_psi_line() {
         let line = "some avg10=0.50 avg60=0.25 avg300=0.10 total=12345";
         let mut parts = line.split_whitespace();
@@ -413,3 +514,4 @@ mod tests {
         assert_eq!(fields.get("total"), Some(&"12345"));
     }
 }
+
