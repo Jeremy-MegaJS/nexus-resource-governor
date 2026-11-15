@@ -35,11 +35,7 @@ fn main() {
             match linux::collect_snapshot() {
                 Ok(snapshot) => {
                     if let Err(error) = serde_json::to_writer(&mut output, &snapshot)
-                        .and_then(|_| {
-                            output
-                                .write_all(b"\n")
-                                .map_err(serde_json::Error::io)
-                        })
+                        .and_then(|_| output.write_all(b"\n").map_err(serde_json::Error::io))
                     {
                         eprintln!("Could not write telemetry sample: {error}");
                         std::process::exit(1);
@@ -79,4 +75,3 @@ fn main() {
     eprintln!("The Linux telemetry backend is not available on this platform yet.");
     std::process::exit(2);
 }
-
