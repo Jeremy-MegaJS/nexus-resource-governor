@@ -4,7 +4,7 @@
 
 NRG monitors system and application resource usage, predicts resource pressure, and applies graduated, user-configurable policies to keep the operating system responsive without unexpectedly terminating important work.
 
-> **Status:** Architecture and requirements phase. Resource-control actions are not implemented or enabled yet.
+> **Status:** Linux telemetry prototype plus a deterministic, read-only policy evaluator and Rescue Mode planner. No resource-control actions are applied yet.
 
 ## Why NRG exists
 
@@ -101,7 +101,16 @@ The first implementation is a read-only Rust CLI. It currently samples:
 - The collector process's current cgroup v2 memory counters.
 - Per-workload cgroup memory, CPU, process-count, and I/O counters from user application, session, and background slices.
 
-The watch mode emits one JSON snapshot per line and flushes each sample, making it useful for correlating resource pressure with freezes. It does not enforce budgets, change cgroups, reserve RAM, or manage other applications yet.
+The watch mode emits one JSON snapshot per line and flushes each sample, making it useful for correlating resource pressure with freezes. The policy evaluator adds an early OOM-risk guard with NORMAL / WATCH / PRESSURE / CRITICAL states. Rescue Mode can generate a dry-run plan for a target application and requested temporary headroom, ranking other user applications that could be offered for save-and-close/pause.
+
+These policy commands are currently advisory only:
+
+```sh
+cargo run -- --policy
+cargo run -- --rescue-plan brave 512
+```
+
+`--rescue-plan` takes a case-insensitive workload-name fragment and extra MiB requested by the priority workload. It reports the estimated shortfall and candidate applications, but does not change cgroups, raise limits, suspend, or close anything. Cgroup memory usage is not guaranteed reclaimable memory. Application state can only be saved through a supported application adapter or by the user. Automatic process termination is prohibited by the policy engine.
 
 Build and run on Linux:
 
@@ -121,3 +130,5 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and [docs/ROADMAP.md](docs/ROAD
 License not selected yet.
 
 
+
+[executed on device: archlinux (bc227e4e-b47b-4157-8834-d4e1828760c0)]
