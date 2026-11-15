@@ -20,7 +20,8 @@ The project is in the requirements and architecture phase. The order prioritizes
 - [x] Discover workloads from the per-user systemd cgroup hierarchy, independent of whether NRG runs in `app.slice`.
 - [x] Use top-level workload cgroups as accounting boundaries; document that `memory.current` includes descendants and must not be summed with nested child cgroups.
 - [x] Correlate top-level workload cgroups with observed `/proc` process membership and bounded per-process RSS diagnostics (not additive).
-- [ ] Build process-tree relationships and stronger application identity beyond cgroup membership.
+- [x] Capture PPID and parent cgroup relationship for observed processes.
+- [ ] Build complete bounded process trees and stronger application identity beyond cgroup membership.
 - [ ] Provide a stable sampling API and bounded local history.
 - [ ] Validate metrics against system tools under normal and stressed workloads.
 

@@ -107,6 +107,9 @@ pub(crate) struct ProcessSnapshot {
     pub(crate) pid: u32,
     pub(crate) comm: String,
     pub(crate) executable: Option<String>,
+    pub(crate) parent_pid: Option<u32>,
+    pub(crate) parent_comm: Option<String>,
+    pub(crate) parent_in_workload: Option<bool>,
     pub(crate) rss_estimate_bytes: Option<u64>,
 }
 
@@ -231,9 +234,18 @@ impl Snapshot {
                         .rss_estimate_bytes
                         .map(|bytes| format!("{:.0} MiB RSS estimate", bytes as f64 / 1_048_576.0))
                         .unwrap_or_else(|| "RSS unavailable".to_owned());
+                    let parent = process
+                        .parent_pid
+                        .map(|pid| format!("parent PID {pid}"))
+                        .unwrap_or_else(|| "parent unknown".to_owned());
+                    let relation = match process.parent_in_workload {
+                        Some(true) => "same workload",
+                        Some(false) => "outside workload",
+                        None => "parent unavailable",
+                    };
                     out.push_str(&format!(
-                        "    PID {} {} ({})\n",
-                        process.pid, process.comm, rss
+                        "    PID {} {} ({}, {}; {})\n",
+                        process.pid, process.comm, rss, parent, relation
                     ));
                 }
             }
@@ -292,7 +304,7 @@ pub fn collect_snapshot() -> io::Result<Snapshot> {
         .as_millis();
 
     Ok(Snapshot {
-        schema_version: 3,
+        schema_version: 4,
         timestamp_unix_ms,
         platform: "linux",
         memory,
@@ -592,6 +604,13 @@ fn parse_unified_process_cgroup(input: &str) -> Option<PathBuf> {
     })
 }
 
+fn parse_process_parent_pid(stat: &str) -> Option<u32> {
+    let (_, fields) = stat.rsplit_once(')')?;
+    let mut fields = fields.split_whitespace();
+    fields.next()?;
+    fields.next()?.parse().ok()
+}
+
 fn parse_process_rss_bytes(status: &str) -> Option<u64> {
     status.lines().find_map(|line| {
         let value = line.strip_prefix("VmRSS:")?.split_whitespace().next()?;
@@ -635,11 +654,6 @@ fn correlate_processes(workloads: &mut [WorkloadSnapshot]) {
         let Some(workload_index) = workload_for_cgroup(workloads, &cgroup) else {
             continue;
         };
-        let Some(workload) = workloads.get_mut(workload_index) else {
-            continue;
-        };
-
-        workload.process_count_observed = workload.process_count_observed.saturating_add(1);
         let comm = fs::read_to_string(process_dir.join("comm"))
             .map(|value| value.trim().to_owned())
             .unwrap_or_else(|_| "unknown".to_owned());
@@ -652,11 +666,32 @@ fn correlate_processes(workloads: &mut [WorkloadSnapshot]) {
         let rss_estimate_bytes = fs::read_to_string(process_dir.join("status"))
             .ok()
             .and_then(|status| parse_process_rss_bytes(&status));
+        let parent_pid = fs::read_to_string(process_dir.join("stat"))
+            .ok()
+            .and_then(|stat| parse_process_parent_pid(&stat));
+        let parent_dir = parent_pid.map(|parent| PathBuf::from(format!("/proc/{parent}")));
+        let parent_comm = parent_dir.as_ref().and_then(|dir| {
+            fs::read_to_string(dir.join("comm"))
+                .ok()
+                .map(|value| value.trim().to_owned())
+        });
+        let parent_in_workload = parent_dir.as_ref().and_then(|dir| {
+            let cgroup_text = fs::read_to_string(dir.join("cgroup")).ok()?;
+            let parent_cgroup = parse_unified_process_cgroup(&cgroup_text)?;
+            Some(workload_for_cgroup(workloads, &parent_cgroup) == Some(workload_index))
+        });
 
+        let Some(workload) = workloads.get_mut(workload_index) else {
+            continue;
+        };
+        workload.process_count_observed = workload.process_count_observed.saturating_add(1);
         workload.top_processes.push(ProcessSnapshot {
             pid,
             comm,
             executable,
+            parent_pid,
+            parent_comm,
+            parent_in_workload,
             rss_estimate_bytes,
         });
         workload
@@ -733,6 +768,13 @@ mod tests {
         );
         assert!(parse_unified_process_cgroup("2:cpu:/system.slice/demo.service").is_none());
         assert!(parse_unified_process_cgroup("0::/../../etc").is_none());
+    }
+
+    #[test]
+    fn parses_process_parent_pid_with_spaces_and_parentheses_in_comm() {
+        let stat = "4321 (worker (child)) S 1234 4321 4321 0 -1 4194304 10 0 0 0 1 2 0 0 20 0 4 0 987654 0 0";
+        assert_eq!(parse_process_parent_pid(stat), Some(1234));
+        assert_eq!(parse_process_parent_pid("malformed"), None);
     }
 
     #[test]
