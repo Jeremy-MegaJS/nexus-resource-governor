@@ -3,10 +3,14 @@ mod linux;
 
 #[cfg(target_os = "linux")]
 fn main() {
-    let mode = std::env::args().nth(1).unwrap_or_else(|| "--json".to_owned());
+    let mode = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "--json".to_owned());
 
     if mode == "--help" || mode == "-h" {
-        println!("nrg-agent [--json|--human]\n\nRead-only Linux resource snapshot. No system settings are changed.");
+        println!(
+            "nrg-agent [--json|--human]\n\nRead-only Linux resource snapshot. No system settings are changed."
+        );
         return;
     }
 
