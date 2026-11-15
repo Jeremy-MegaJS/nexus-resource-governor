@@ -230,7 +230,7 @@ The OOM guard is an early-warning and coordination layer, not a replacement for 
 
 The Linux snapshot reports the controllers visible to the current cgroup, the controllers enabled for its children, whether memory accounting files are present, and whether cgroup.subtree_control can be opened for writing by the current process. The write-open check does not write to the control file and does not change system state.
 
-This is a capability signal, not proof that systemd delegated a complete writable subtree: creating child cgroups, enabling controllers, and managing processes require additional permissions and hierarchy checks. Enforcement must revalidate those permissions at the point of use and must never infer delegation from controller visibility alone. The snapshot schema is version 2 because the capability report is a new top-level field.
+This is a capability signal, not proof that systemd delegated a complete writable subtree: creating child cgroups, enabling controllers, and managing processes require additional permissions and hierarchy checks. Enforcement must revalidate those permissions at the point of use and must never infer delegation from controller visibility alone. The snapshot schema was bumped to version 2 when capability reporting was added; version 3 adds bounded process-correlation diagnostics.
 
 
 ## 15. Workload hierarchy and memory attribution
@@ -241,5 +241,11 @@ For each supported user slice (`app.slice`, `session.slice`, and `background.sli
 
 This is cgroup-level attribution, not proof that every byte belongs exclusively to one GUI application: shared services, delegated sub-cgroups, and processes outside these user slices need separate attribution rules. Missing or inaccessible cgroups remain unavailable rather than being estimated. Discovery remains read-only.
 
+
+## 16. Process-to-workload correlation
+
+The read-only Linux collector scans numeric `/proc` entries and maps each process's unified cgroup path to the nearest discovered top-level workload accounting boundary. It reports the observed process count and at most five processes with PID, `comm`, executable basename when readable, and `VmRSS` estimate. Command-line arguments are deliberately not collected because they can contain credentials or other sensitive data.
+
+`memory.current` remains the authoritative aggregate workload charge, including descendants. Per-process `VmRSS` is an informational estimate only: shared pages can appear in multiple processes' RSS, so process RSS values must never be summed as a replacement for cgroup accounting. Process enumeration is inherently racy; exited, inaccessible, or rapidly moving processes may be missed. The observed count is therefore diagnostic and may differ from `pids.current` (which counts tasks, including threads).
 
 Systemd-escaped unit names are decoded for display and policy matching (for example, `\x2d` becomes `-`). The original cgroup path remains unchanged and is the authoritative workload locator. This matters for protected-workload checks: matching a human-readable unit name against its escaped kernel cgroup spelling can otherwise fail.

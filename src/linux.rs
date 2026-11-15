@@ -98,6 +98,16 @@ pub(crate) struct WorkloadSnapshot {
     pub(crate) io_read_bytes: u64,
     pub(crate) io_write_bytes: u64,
     pub(crate) memory_events: BTreeMap<String, u64>,
+    pub(crate) process_count_observed: u64,
+    pub(crate) top_processes: Vec<ProcessSnapshot>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct ProcessSnapshot {
+    pub(crate) pid: u32,
+    pub(crate) comm: String,
+    pub(crate) executable: Option<String>,
+    pub(crate) rss_estimate_bytes: Option<u64>,
 }
 
 impl Snapshot {
@@ -204,18 +214,30 @@ impl Snapshot {
             out.push_str("Current cgroup: unavailable (not cgroup v2 or inaccessible)\n");
         }
         if !self.workloads.is_empty() {
-            out.push_str("Top user workloads (cgroup memory):\n");
+            out.push_str("Top user workloads (cgroup memory; aggregate source):\n");
             for workload in self.workloads.iter().take(8) {
                 let memory_gib =
                     workload.memory_current_bytes.unwrap_or(0) as f64 / 1_073_741_824.0;
                 out.push_str(&format!(
-                    "  {}/{}: {:.2} GiB, {} tasks\n",
+                    "  {}/{}: {:.2} GiB, {} tasks, {} processes observed\n",
                     workload.slice,
                     workload.name,
                     memory_gib,
-                    workload.pids_current.unwrap_or(0)
+                    workload.pids_current.unwrap_or(0),
+                    workload.process_count_observed
                 ));
+                for process in workload.top_processes.iter().take(3) {
+                    let rss = process
+                        .rss_estimate_bytes
+                        .map(|bytes| format!("{:.0} MiB RSS estimate", bytes as f64 / 1_048_576.0))
+                        .unwrap_or_else(|| "RSS unavailable".to_owned());
+                    out.push_str(&format!(
+                        "    PID {} {} ({})\n",
+                        process.pid, process.comm, rss
+                    ));
+                }
             }
+            out.push_str("Process RSS values are per-process estimates and must not be summed; shared pages can be counted more than once.\n");
         }
         out
     }
@@ -270,7 +292,7 @@ pub fn collect_snapshot() -> io::Result<Snapshot> {
         .as_millis();
 
     Ok(Snapshot {
-        schema_version: 2,
+        schema_version: 3,
         timestamp_unix_ms,
         platform: "linux",
         memory,
@@ -548,12 +570,100 @@ fn read_workloads() -> io::Result<Vec<WorkloadSnapshot>> {
                 io_read_bytes,
                 io_write_bytes,
                 memory_events,
+                process_count_observed: 0,
+                top_processes: Vec::new(),
             });
         }
     }
 
+    correlate_processes(&mut workloads);
     workloads.sort_by_key(|item| std::cmp::Reverse(item.memory_current_bytes.unwrap_or(0)));
     Ok(workloads)
+}
+
+fn parse_unified_process_cgroup(input: &str) -> Option<PathBuf> {
+    input.lines().find_map(|line| {
+        let mut parts = line.splitn(3, ':');
+        if parts.next()? == "0" && parts.next()?.is_empty() {
+            safe_cgroup_relative_path(parts.next()?)
+        } else {
+            None
+        }
+    })
+}
+
+fn parse_process_rss_bytes(status: &str) -> Option<u64> {
+    status.lines().find_map(|line| {
+        let value = line.strip_prefix("VmRSS:")?.split_whitespace().next()?;
+        value
+            .parse::<u64>()
+            .ok()
+            .map(|kib| kib.saturating_mul(1024))
+    })
+}
+
+fn workload_for_cgroup(workloads: &[WorkloadSnapshot], process_cgroup: &Path) -> Option<usize> {
+    workloads.iter().position(|workload| {
+        let Ok(relative) = Path::new(&workload.path).strip_prefix(CGROUP_ROOT) else {
+            return false;
+        };
+        process_cgroup == relative || process_cgroup.starts_with(relative)
+    })
+}
+
+fn correlate_processes(workloads: &mut [WorkloadSnapshot]) {
+    const TOP_PROCESSES: usize = 5;
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let Some(pid) = file_name
+            .to_str()
+            .and_then(|value| value.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let process_dir = entry.path();
+        let Ok(cgroup_text) = fs::read_to_string(process_dir.join("cgroup")) else {
+            continue;
+        };
+        let Some(cgroup) = parse_unified_process_cgroup(&cgroup_text) else {
+            continue;
+        };
+        let Some(workload_index) = workload_for_cgroup(workloads, &cgroup) else {
+            continue;
+        };
+        let Some(workload) = workloads.get_mut(workload_index) else {
+            continue;
+        };
+
+        workload.process_count_observed = workload.process_count_observed.saturating_add(1);
+        let comm = fs::read_to_string(process_dir.join("comm"))
+            .map(|value| value.trim().to_owned())
+            .unwrap_or_else(|_| "unknown".to_owned());
+        let executable = fs::read_link(process_dir.join("exe"))
+            .ok()
+            .and_then(|path| {
+                path.file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+            });
+        let rss_estimate_bytes = fs::read_to_string(process_dir.join("status"))
+            .ok()
+            .and_then(|status| parse_process_rss_bytes(&status));
+
+        workload.top_processes.push(ProcessSnapshot {
+            pid,
+            comm,
+            executable,
+            rss_estimate_bytes,
+        });
+        workload
+            .top_processes
+            .sort_by_key(|process| std::cmp::Reverse(process.rss_estimate_bytes.unwrap_or(0)));
+        workload.top_processes.truncate(TOP_PROCESSES);
+    }
 }
 
 fn read_u64(path: PathBuf) -> io::Result<u64> {
@@ -609,6 +719,62 @@ fn parse_key_values(input: &str) -> BTreeMap<String, u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_unified_process_cgroup_membership() {
+        let parsed = parse_unified_process_cgroup(
+            "12:memory:/legacy\n0::/user.slice/user-1000.slice/app.slice/app-demo.scope\n",
+        );
+        assert_eq!(
+            parsed,
+            Some(PathBuf::from(
+                "user.slice/user-1000.slice/app.slice/app-demo.scope"
+            ))
+        );
+        assert!(parse_unified_process_cgroup("2:cpu:/system.slice/demo.service").is_none());
+        assert!(parse_unified_process_cgroup("0::/../../etc").is_none());
+    }
+
+    #[test]
+    fn parses_process_rss_as_bytes_without_treating_it_as_aggregate_memory() {
+        let status = "Name:\tdemo\nVmSize:\t900000 kB\nVmRSS:\t1234 kB\n";
+        assert_eq!(parse_process_rss_bytes(status), Some(1_263_616));
+        assert_eq!(parse_process_rss_bytes("Name:\tdemo\n"), None);
+    }
+
+    #[test]
+    fn maps_nested_process_cgroups_to_the_accounting_boundary() {
+        let workload = WorkloadSnapshot {
+            slice: "app.slice".to_owned(),
+            name: "app-demo.scope".to_owned(),
+            path: "/sys/fs/cgroup/user.slice/user-1000.slice/app.slice/app-demo.scope".to_owned(),
+            memory_current_bytes: Some(4096),
+            memory_anon_bytes: None,
+            memory_file_bytes: None,
+            cpu_usage_usec: None,
+            pids_current: Some(2),
+            io_read_bytes: 0,
+            io_write_bytes: 0,
+            memory_events: BTreeMap::new(),
+            process_count_observed: 0,
+            top_processes: Vec::new(),
+        };
+        let workloads = vec![workload];
+        assert!(
+            workload_for_cgroup(
+                &workloads,
+                Path::new("user.slice/user-1000.slice/app.slice/app-demo.scope/child")
+            )
+            .is_some()
+        );
+        assert!(
+            workload_for_cgroup(
+                &workloads,
+                Path::new("user.slice/user-1000.slice/app.slice/app-demo.scope-other")
+            )
+            .is_none()
+        );
+    }
 
     #[test]
     fn parses_meminfo_values_in_kib() {

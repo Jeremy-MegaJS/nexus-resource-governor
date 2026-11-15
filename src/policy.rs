@@ -224,6 +224,8 @@ mod tests {
             io_read_bytes: 0,
             io_write_bytes: 0,
             memory_events: Default::default(),
+            process_count_observed: 0,
+            top_processes: Vec::new(),
         };
         snapshot.workloads = vec![
             workload(
