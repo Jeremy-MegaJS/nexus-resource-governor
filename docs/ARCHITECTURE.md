@@ -214,3 +214,16 @@ Proposed direction:
 - **Tests:** deterministic policy tests, backend integration tests, stress tests, and fault-injection tests.
 
 This is a proposed stack, not a locked implementation decision.
+
+
+## 13. Early OOM guard and Rescue Mode
+
+The first policy implementation is deliberately read-only. It evaluates available physical RAM and memory PSI into NORMAL, WATCH, PRESSURE, and CRITICAL states. The reserve target is adaptive (25% of detected physical memory, bounded between 512 MiB and 2 GiB) and is a policy signal, not preallocated memory. The guard never terminates a process.
+
+Rescue Mode accepts a priority workload and a requested temporary headroom amount. It calculates the current shortfall against the reserve target and ranks other user application cgroups as possible candidates for a user-approved save/close or pause. Reported cgroup usage is only an upper bound: it is not a prediction of reclaimable memory. The collector's own cgroup and desktop/session infrastructure are excluded from candidate selection.
+
+The next implementation must replace this advisory plan with a transaction-like workflow: confirm the target and candidates, request save through an application adapter or direct user action, verify the save result where possible, apply a scoped and expiring budget override, monitor the temporary window, and restore prior values. If the application cannot confirm save, NRG must say so and must not close it automatically.
+
+The OOM guard is an early-warning and coordination layer, not a replacement for the Linux kernel OOM killer. It should intervene before the kernel reaches OOM where telemetry allows, while leaving the kernel as the final safety mechanism.
+
+[executed on device: archlinux (bc227e4e-b47b-4157-8834-d4e1828760c0)]
