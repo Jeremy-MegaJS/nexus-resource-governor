@@ -91,6 +91,25 @@ NRG cannot generically save every application's state. Graceful save/close suppo
 - No intervention based only on a single utilization percentage.
 - Every applied limit must have an owner, expiry/recovery behavior, and audit record.
 
+## Linux telemetry prototype
+
+The first implementation is a read-only Rust CLI. It currently samples:
+- Physical memory and swap from /proc/meminfo.
+- Memory PSI from /proc/pressure/memory.
+- ZRAM compression and physical-memory accounting from sysfs.
+- Selected paging and reclaim counters from /proc/vmstat.
+- The collector process's current cgroup v2 memory counters.
+
+It does not enforce budgets, change cgroups, reserve RAM, or manage other applications yet.
+
+Build and run on Linux:
+
+```sh
+cargo test
+cargo run -- --human
+cargo run -- --json
+```
+
 ## Development
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and [docs/ROADMAP.md](docs/ROADMAP.md).
