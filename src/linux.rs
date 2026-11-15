@@ -65,10 +65,10 @@ struct Zram {
 struct CgroupSnapshot {
     path: String,
     memory_current_bytes: Option<u64>,
-    memory_high_bytes: Option<u64>,
-    memory_max_bytes: Option<u64>,
+    memory_high_limit: Option<String>,
+    memory_max_limit: Option<String>,
     memory_swap_current_bytes: Option<u64>,
-    memory_swap_max_bytes: Option<u64>,
+    memory_swap_max_limit: Option<String>,
     memory_events: BTreeMap<String, u64>,
 }
 
@@ -84,8 +84,11 @@ impl Snapshot {
         if let Some(zram) = &self.zram {
             push_metric(&mut out, &format!("{} compressed data", zram.device), zram.compressed_data_bytes);
             push_metric(&mut out, &format!("{} physical memory used", zram.device), zram.memory_used_bytes);
-            if let Some(ratio) = zram.compression_ratio {
-                out.push_str(&format!("{} compression ratio: {:.2}:1\n", zram.device, ratio));
+            if let Some(ratio) = zram.payload_compression_ratio {
+                out.push_str(&format!("{} payload compression: {:.2}:1\n", zram.device, ratio));
+            }
+            if let Some(ratio) = zram.effective_compression_ratio {
+                out.push_str(&format!("{} effective compression: {:.2}:1\n", zram.device, ratio));
             }
         } else {
             out.push_str("ZRAM: not detected or unavailable\n");
@@ -109,7 +112,7 @@ impl Snapshot {
         if let Some(cgroup) = &self.cgroup_v2 {
             out.push_str(&format!("Current cgroup: {}\n", cgroup.path));
             push_metric(&mut out, "Cgroup memory.current", cgroup.memory_current_bytes);
-            push_metric(&mut out, "Cgroup memory.high", cgroup.memory_high_bytes);
+            out.push_str(&format!("Cgroup memory.high: {}\n", cgroup.memory_high_limit.as_deref().unwrap_or("unavailable")));
         } else {
             out.push_str("Current cgroup: unavailable (not cgroup v2 or inaccessible)\n");
         }
@@ -261,10 +264,7 @@ fn read_current_cgroup() -> io::Result<Option<CgroupSnapshot>> {
     });
     let Some(relative) = relative else { return Ok(None) };
 
-    let relative_path = Path::new(relative.trim_start_matches('/'));
-    if relative_path.components().any(|part| matches!(part, Component::ParentDir | Component::RootDir | Component::Prefix(_))) {
-        return Ok(None);
-    }
+    let Some(relative_path) = safe_cgroup_relative_path(&relative) else { return Ok(None) };
     let base = Path::new(CGROUP_ROOT).join(relative_path);
     if !base.join("memory.current").exists() {
         return Ok(None);
@@ -277,10 +277,10 @@ fn read_current_cgroup() -> io::Result<Option<CgroupSnapshot>> {
     Ok(Some(CgroupSnapshot {
         path: relative,
         memory_current_bytes: read_u64(base.join("memory.current")).ok(),
-        memory_high_bytes: read_limit(base.join("memory.high")).ok().flatten(),
-        memory_max_bytes: read_limit(base.join("memory.max")).ok().flatten(),
+        memory_high_limit: read_limit(base.join("memory.high")).ok(),
+        memory_max_limit: read_limit(base.join("memory.max")).ok(),
         memory_swap_current_bytes: read_u64(base.join("memory.swap.current")).ok(),
-        memory_swap_max_bytes: read_limit(base.join("memory.swap.max")).ok().flatten(),
+        memory_swap_max_limit: read_limit(base.join("memory.swap.max")).ok(),
         memory_events,
     }))
 }
@@ -289,13 +289,16 @@ fn read_u64(path: PathBuf) -> io::Result<u64> {
     fs::read_to_string(path)?.trim().parse().map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid numeric value"))
 }
 
-fn read_limit(path: PathBuf) -> io::Result<Option<u64>> {
-    let value = fs::read_to_string(path)?;
-    let trimmed = value.trim();
-    if trimmed == "max" {
-        Ok(None)
+fn read_limit(path: PathBuf) -> io::Result<String> {
+    Ok(fs::read_to_string(path)?.trim().to_owned())
+}
+
+fn safe_cgroup_relative_path(path: &str) -> Option<PathBuf> {
+    let relative = Path::new(path.trim_start_matches('/'));
+    if relative.components().any(|part| matches!(part, Component::ParentDir | Component::RootDir | Component::Prefix(_))) {
+        None
     } else {
-        trimmed.parse().map(Some).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid cgroup limit"))
+        Some(relative.to_path_buf())
     }
 }
 
@@ -321,6 +324,17 @@ mod tests {
     fn parses_cgroup_key_values() {
         let parsed = parse_key_values("low 1\nhigh 2\nmax 3\n");
         assert_eq!(parsed.get("high"), Some(&2));
+    }
+
+    #[test]
+    fn accepts_absolute_kernel_cgroup_path_as_relative_to_mount() {
+        let path = safe_cgroup_relative_path("/user.slice/user-1000.slice").unwrap();
+        assert_eq!(path, PathBuf::from("user.slice/user-1000.slice"));
+    }
+
+    #[test]
+    fn rejects_parent_traversal_in_cgroup_path() {
+        assert!(safe_cgroup_relative_path("/../../etc").is_none());
     }
 
     #[test]
