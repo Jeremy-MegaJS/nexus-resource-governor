@@ -528,6 +528,3 @@ mod tests {
         assert_eq!(fields.get("total"), Some(&"12345"));
     }
 }
-
-
-
