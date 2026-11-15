@@ -737,41 +737,144 @@ fn correlate_processes(workloads: &mut [WorkloadSnapshot]) {
         sample.truncate(MAX_PROCESS_TREE_NODES);
     }
 
-    for (workload, processes) in workloads.iter_mut().zip(observed) {
-        workload.top_processes = processes.iter().take(TOP_PROCESSES).cloned().collect();
-        let (tree, _) = build_bounded_process_tree(processes, MAX_PROCESS_TREE_NODES);
+    for (workload_index, mut processes) in observed.into_iter().enumerate() {
+        processes.sort_by(|a, b| {
+            b.rss_estimate_bytes
+                .unwrap_or(0)
+                .cmp(&a.rss_estimate_bytes.unwrap_or(0))
+                .then_with(|| a.pid.cmp(&b.pid))
+        });
+        let top_processes: Vec<ProcessSnapshot> =
+            processes.iter().take(TOP_PROCESSES).cloned().collect();
+        let (tree, mut truncated) = build_ancestor_closed_process_tree(
+            top_processes.clone(),
+            MAX_PROCESS_TREE_NODES,
+            |pid| read_process_snapshot_for_workload(pid, workload_index, workloads),
+        );
+        truncated |= workloads[workload_index].process_count_observed > tree.len() as u64;
         let tree_pids: std::collections::BTreeSet<u32> =
             tree.iter().map(|process| process.pid).collect();
-        for process in &mut workload.top_processes {
+        let mut top_processes = top_processes;
+        for process in &mut top_processes {
             process.parent_in_tree = process.parent_pid.map(|pid| tree_pids.contains(&pid));
         }
-        workload.process_tree = tree;
-        workload.process_tree_truncated =
-            workload.process_count_observed > MAX_PROCESS_TREE_NODES as u64;
+        if let Some(workload) = workloads.get_mut(workload_index) {
+            workload.top_processes = top_processes;
+            workload.process_tree = tree;
+            workload.process_tree_truncated = truncated;
+        }
     }
 }
 
-fn build_bounded_process_tree(
-    mut processes: Vec<ProcessSnapshot>,
-    max_nodes: usize,
-) -> (Vec<ProcessSnapshot>, bool) {
-    processes.sort_by(|a, b| {
-        b.rss_estimate_bytes
-            .unwrap_or(0)
-            .cmp(&a.rss_estimate_bytes.unwrap_or(0))
-            .then_with(|| a.pid.cmp(&b.pid))
+fn read_process_snapshot_for_workload(
+    pid: u32,
+    workload_index: usize,
+    workloads: &[WorkloadSnapshot],
+) -> Option<ProcessSnapshot> {
+    let process_dir = PathBuf::from(format!("/proc/{pid}"));
+    let cgroup_text = fs::read_to_string(process_dir.join("cgroup")).ok()?;
+    let cgroup = parse_unified_process_cgroup(&cgroup_text)?;
+    if workload_for_cgroup(workloads, &cgroup) != Some(workload_index) {
+        return None;
+    }
+
+    let comm = fs::read_to_string(process_dir.join("comm"))
+        .ok()
+        .map(|value| value.trim().to_owned())?;
+    let executable = fs::read_link(process_dir.join("exe"))
+        .ok()
+        .and_then(|path| {
+            path.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        });
+    let rss_estimate_bytes = fs::read_to_string(process_dir.join("status"))
+        .ok()
+        .and_then(|status| parse_process_rss_bytes(&status));
+    let parent_pid = fs::read_to_string(process_dir.join("stat"))
+        .ok()
+        .and_then(|stat| parse_process_parent_pid(&stat));
+    let parent_dir = parent_pid.map(|parent| PathBuf::from(format!("/proc/{parent}")));
+    let parent_comm = parent_dir.as_ref().and_then(|dir| {
+        fs::read_to_string(dir.join("comm"))
+            .ok()
+            .map(|value| value.trim().to_owned())
     });
-    let truncated = processes.len() > max_nodes;
-    processes.truncate(max_nodes);
+    let parent_in_workload = parent_dir.as_ref().and_then(|dir| {
+        let cgroup_text = fs::read_to_string(dir.join("cgroup")).ok()?;
+        let parent_cgroup = parse_unified_process_cgroup(&cgroup_text)?;
+        Some(workload_for_cgroup(workloads, &parent_cgroup) == Some(workload_index))
+    });
+
+    Some(ProcessSnapshot {
+        pid,
+        comm,
+        executable,
+        parent_pid,
+        parent_comm,
+        parent_in_workload,
+        parent_in_tree: None,
+        rss_estimate_bytes,
+    })
+}
+
+fn build_ancestor_closed_process_tree(
+    seeds: Vec<ProcessSnapshot>,
+    max_nodes: usize,
+    mut lookup_parent: impl FnMut(u32) -> Option<ProcessSnapshot>,
+) -> (Vec<ProcessSnapshot>, bool) {
+    let mut processes = Vec::with_capacity(max_nodes);
+    let mut included_pids = std::collections::BTreeSet::new();
+    let mut pending = std::collections::VecDeque::new();
+
+    for mut seed in seeds {
+        if processes.len() >= max_nodes {
+            break;
+        }
+        if included_pids.insert(seed.pid) {
+            seed.parent_in_tree = None;
+            if seed.parent_in_workload == Some(true) {
+                if let Some(parent_pid) = seed.parent_pid {
+                    pending.push_back(parent_pid);
+                }
+            }
+            processes.push(seed);
+        }
+    }
+
+    while processes.len() < max_nodes {
+        let Some(parent_pid) = pending.pop_front() else {
+            break;
+        };
+        if included_pids.contains(&parent_pid) {
+            continue;
+        }
+        let Some(parent) = lookup_parent(parent_pid) else {
+            continue;
+        };
+        if parent.pid != parent_pid || !included_pids.insert(parent.pid) {
+            continue;
+        }
+        if parent.parent_in_workload == Some(true) {
+            if let Some(next_parent) = parent.parent_pid {
+                pending.push_back(next_parent);
+            }
+        }
+        processes.push(parent);
+    }
 
     let included_pids: std::collections::BTreeSet<u32> =
         processes.iter().map(|process| process.pid).collect();
     for process in &mut processes {
         process.parent_in_tree = process.parent_pid.map(|pid| included_pids.contains(&pid));
     }
-
-    // The serialized representation is a flat, bounded graph; parent_pid carries each edge.
     processes.sort_by_key(|process| process.pid);
+    let pending_unresolved = pending.iter().any(|pid| !included_pids.contains(pid));
+    let truncated = pending_unresolved
+        || processes.iter().any(|process| {
+            process.parent_in_workload == Some(true)
+                && process.parent_pid.is_some()
+                && process.parent_in_tree != Some(true)
+        });
     (processes, truncated)
 }
 
@@ -843,14 +946,14 @@ mod tests {
     }
 
     #[test]
-    fn bounded_process_tree_is_deterministic_and_marks_missing_parent_edges() {
-        let processes = vec![
-            process_fixture(30, Some(10), Some(300)),
-            process_fixture(20, Some(99), Some(200)),
-            process_fixture(10, None, Some(100)),
-        ];
+    fn process_tree_is_deterministic_and_marks_missing_parent_edges() {
+        let mut first = process_fixture(30, Some(10), Some(300));
+        first.parent_in_workload = Some(true);
+        let mut second = process_fixture(20, Some(99), Some(200));
+        second.parent_in_workload = Some(true);
 
-        let (tree, truncated) = build_bounded_process_tree(processes, 2);
+        let (tree, truncated) =
+            build_ancestor_closed_process_tree(vec![first, second], 2, |_| None);
 
         assert!(truncated);
         assert_eq!(
@@ -862,13 +965,13 @@ mod tests {
     }
 
     #[test]
-    fn bounded_process_tree_keeps_parent_edges_when_parent_is_in_sample() {
-        let processes = vec![
-            process_fixture(20, Some(10), Some(200)),
-            process_fixture(10, None, Some(100)),
-        ];
+    fn process_tree_keeps_parent_edges_when_parent_is_in_sample() {
+        let mut child = process_fixture(20, Some(10), Some(200));
+        child.parent_in_workload = Some(true);
+        let parent = process_fixture(10, None, Some(100));
 
-        let (tree, truncated) = build_bounded_process_tree(processes, 2);
+        let (tree, truncated) =
+            build_ancestor_closed_process_tree(vec![child, parent], 2, |_| None);
 
         assert!(!truncated);
         assert_eq!(
@@ -882,11 +985,76 @@ mod tests {
     #[test]
     fn bounded_process_tree_marks_unknown_parent_without_inventing_an_edge() {
         let (tree, truncated) =
-            build_bounded_process_tree(vec![process_fixture(7, None, None)], 32);
+            build_ancestor_closed_process_tree(vec![process_fixture(7, None, None)], 32, |_| None);
 
         assert!(!truncated);
         assert_eq!(tree[0].parent_pid, None);
         assert_eq!(tree[0].parent_in_tree, None);
+    }
+
+    #[test]
+    fn process_tree_adds_ancestors_of_top_processes() {
+        let seed = process_fixture(30, Some(20), Some(300));
+        let parent = process_fixture(20, Some(10), Some(100));
+        let grandparent = process_fixture(10, None, Some(50));
+
+        let (tree, truncated) =
+            build_ancestor_closed_process_tree(vec![seed], 32, |pid| match pid {
+                20 => Some(parent.clone()),
+                10 => Some(grandparent.clone()),
+                _ => None,
+            });
+
+        assert!(!truncated);
+        assert_eq!(
+            tree.iter().map(|process| process.pid).collect::<Vec<_>>(),
+            vec![10, 20, 30]
+        );
+        assert_eq!(
+            tree.iter()
+                .find(|process| process.pid == 30)
+                .unwrap()
+                .parent_in_tree,
+            Some(true)
+        );
+        assert_eq!(
+            tree.iter()
+                .find(|process| process.pid == 20)
+                .unwrap()
+                .parent_in_tree,
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn process_tree_stops_at_node_cap_and_reports_truncation() {
+        let seed = process_fixture(30, Some(20), Some(300));
+        let parent = process_fixture(20, Some(10), Some(100));
+
+        let (tree, truncated) =
+            build_ancestor_closed_process_tree(vec![seed], 2, |pid| match pid {
+                20 => Some(parent.clone()),
+                10 => Some(process_fixture(10, None, Some(50))),
+                _ => None,
+            });
+
+        assert!(truncated);
+        assert_eq!(tree.len(), 2);
+        assert_eq!(
+            tree.iter().map(|process| process.pid).collect::<Vec<_>>(),
+            vec![20, 30]
+        );
+    }
+
+    #[test]
+    fn process_tree_does_not_import_parent_from_another_workload() {
+        let mut seed = process_fixture(30, Some(20), Some(300));
+        seed.parent_in_workload = Some(true);
+        let (tree, truncated) = build_ancestor_closed_process_tree(vec![seed], 32, |_| None);
+
+        assert!(truncated);
+        assert_eq!(tree.len(), 1);
+        assert_eq!(tree[0].parent_in_tree, Some(false));
     }
 
     #[test]
