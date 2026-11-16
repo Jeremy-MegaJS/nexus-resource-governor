@@ -84,9 +84,12 @@ The project currently has a read-only Linux telemetry backend and a policy/Rescu
 - [x] Add optional KSystemStats sensor integration for CPU/GPU thermal/usage, battery, Wi-Fi signal, fan, and disk I/O where available.
 - [x] Add opt-in speed test: bidirectional with speedtest-cli; bounded download-only fallback otherwise.
 - [x] Add a user toggle to disable anomaly heuristics and executable-path inspection while retaining the process manager.
+- [x] Add an Applications view grouped by cgroup v2 workload with cgroup memory.current and process drill-down.
+- [x] Add a History view for RAM, swap, PSI pressure, and top workload memory using the monitor's bounded telemetry.
 - [ ] Add system tray integration and configurable refresh/telemetry cost modes.
 - [ ] Add persistent workload identity and editable per-app memory floors/ceilings.
-- [ ] Add package ownership, complete process-tree growth correlation, per-cgroup network counters, per-process GPU/network attribution, app-group lifecycle actions, connection/persistence context, without collecting command-line arguments or secrets.
+- [x] Add confirmation-gated STOP/CONT/TERM/KILL actions for the currently observed PIDs in a selected cgroup workload.
+- [ ] Add package ownership, complete process-tree growth correlation, per-cgroup network counters, per-process GPU/network attribution, full app-group lifecycle tracking, connection/persistence context, without collecting command-line arguments or secrets.
 - [ ] Implement safe, capability-checked cgroup memory.high enforcement with explicit approval, expiry, audit, and rollback.
 - [ ] Implement per-workload network shaping using a validated cgroup-v2/eBPF or equivalent backend, with explicit approval and rollback.
 

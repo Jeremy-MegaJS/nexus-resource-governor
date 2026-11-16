@@ -3,13 +3,13 @@
 from __future__ import annotations
 import json, os, pwd, re, signal, shlex, shutil, subprocess, sys, time, urllib.request
 from pathlib import Path
-from PySide6.QtCore import Qt, QProcess, QTimer, QThread, Signal
-from PySide6.QtGui import QFont
+from PySide6.QtCore import Qt, QProcess, QTimer, QThread, Signal, QPointF
+from PySide6.QtGui import QFont, QColor, QPainter, QPen, QPolygonF
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QGridLayout,
     QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMenu, QMessageBox, QPushButton,
     QInputDialog, QTabWidget, QTableWidget, QTableWidgetItem, QTextEdit, QVBoxLayout,
-    QWidget, QHeaderView,
+    QWidget, QHeaderView, QScrollArea,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -129,6 +129,14 @@ def scan_processes(include_security=True):
                     exe = ""
             else:
                 exe = ""
+            cgroup = ""
+            try:
+                for line in (base / "cgroup").read_text().splitlines():
+                    if line.startswith("0::"):
+                        cgroup = line.split("::", 1)[1]
+                        break
+            except OSError:
+                pass
             read_bytes = write_bytes = 0
             try:
                 for line in (base / "io").read_text().splitlines():
@@ -144,7 +152,7 @@ def scan_processes(include_security=True):
             procs.append({
                 "pid": pid, "ppid": ppid, "name": comm, "state": state,
                 "ticks": ticks, "start": start, "rss": rss, "uid": uid,
-                "owner": owner, "exe": exe, "read": read_bytes,
+                "owner": owner, "exe": exe, "cgroup": cgroup, "read": read_bytes,
                 "write": write_bytes, "seen": now,
             })
         except (OSError, ValueError, IndexError, PermissionError):
@@ -211,6 +219,92 @@ def cell(value, align=None):
     obj = QTableWidgetItem(str(value))
     if align is not None: obj.setTextAlignment(align)
     return obj
+
+
+def load_history_samples(path=None, max_samples=360):
+    path = path or (Path.home() / ".local/state/nrg/telemetry.jsonl")
+    try:
+        lines = path.read_text(errors="replace").splitlines()[-max_samples:]
+    except OSError:
+        return []
+    samples = []
+    for line in lines:
+        try:
+            item = json.loads(line)
+            if isinstance(item, dict) and isinstance(item.get("timestamp_unix_ms"), (int, float)):
+                samples.append(item)
+        except (ValueError, TypeError):
+            continue
+    return samples
+
+
+class HistoryChart(QWidget):
+    PALETTE = ["#48b8e8", "#e2ad55", "#b28ae6", "#69c69a", "#e47777"]
+
+    def __init__(self, title, parent=None):
+        super().__init__(parent)
+        self.title = title
+        self.series = {}
+        self.times = []
+        self.setMinimumHeight(175)
+
+    def set_data(self, series, times):
+        self.series = {name: [float(value) for value in values] for name, values in series.items()}
+        self.times = list(times)
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(QColor("#e9e9eb"))
+        painter.drawText(12, 20, self.title)
+        if not self.series or not any(self.series.values()):
+            painter.setPen(QColor("#9a9da6"))
+            painter.drawText(18, 58, "No history samples available")
+            painter.end()
+            return
+        left, top, right, bottom = 58, 34, 16, 34
+        width = max(1, self.width() - left - right)
+        height = max(1, self.height() - top - bottom)
+        all_values = [v for values in self.series.values() for v in values if v == v]
+        if not all_values:
+            painter.end(); return
+        low, high = min(all_values), max(all_values)
+        if high - low < 0.001:
+            high = low + 1.0
+        else:
+            pad = (high - low) * 0.08
+            low, high = max(0, low - pad), high + pad
+        painter.setPen(QPen(QColor("#343840"), 1))
+        for tick in range(5):
+            y = top + height * tick / 4
+            painter.drawLine(int(left), int(y), int(left + width), int(y))
+            value = high - (high - low) * tick / 4
+            painter.setPen(QColor("#9a9da6"))
+            painter.drawText(4, int(y + 4), f"{value:.1f}")
+            painter.setPen(QPen(QColor("#343840"), 1))
+        for index, (name, values) in enumerate(self.series.items()):
+            if len(values) < 2: continue
+            points = QPolygonF()
+            count = len(values)
+            for i, value in enumerate(values):
+                x = left + width * i / max(1, count - 1)
+                y = top + height * (high - value) / (high - low)
+                points.append(QPointF(x, y))
+            painter.setPen(QPen(QColor(self.PALETTE[index % len(self.PALETTE)]), 2))
+            painter.drawPolyline(points)
+        painter.setPen(QColor("#9a9da6"))
+        if self.times:
+            painter.drawText(int(left), self.height() - 7, self.times[0])
+            painter.drawText(int(left + width - 90), self.height() - 7, self.times[-1])
+        legend_x = left + 12
+        for index, name in enumerate(self.series):
+            painter.setPen(QPen(QColor(self.PALETTE[index % len(self.PALETTE)]), 3))
+            painter.drawLine(int(legend_x), self.height() - 20, int(legend_x + 14), self.height() - 20)
+            painter.setPen(QColor("#c7c8cc"))
+            painter.drawText(int(legend_x + 19), self.height() - 16, name[:22])
+            legend_x += min(150, 35 + len(name) * 7)
+        painter.end()
 
 
 class NetworkTestWorker(QThread):
@@ -307,6 +401,7 @@ class NRGWindow(QMainWindow):
         self.timer = QTimer(self); self.timer.timeout.connect(self.refresh)
         self.timer.start(REFRESH_MS)
         self.refresh()
+        self.refresh_history()
 
     def _build_ui(self):
         self.setStyleSheet("""
@@ -334,7 +429,7 @@ class NRGWindow(QMainWindow):
         head.addWidget(self.language_box); head.addWidget(self.live)
         root.addLayout(head)
         self.tabs = QTabWidget(); root.addWidget(self.tabs)
-        self._dashboard(); self._process_tab(); self._diagnostics_tab()
+        self._dashboard(); self._process_tab(); self._applications_tab(); self._history_tab(); self._diagnostics_tab()
         self.language_box.currentIndexChanged.connect(self.change_language)
         self.language = self.language_box.currentData() or "en"
         self.setCentralWidget(central)
@@ -378,7 +473,7 @@ class NRGWindow(QMainWindow):
         self.alert_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.alert_table.cellDoubleClicked.connect(self.open_alert_details)
         layout.addWidget(self.alert_table, 1)
-        self.dashboard_note = QLabel("Read-only monitoring. No process is terminated and no kernel/cgroup setting is changed.")
+        self.dashboard_note = QLabel("System telemetry is read-only by default. Process controls require an explicit selection; no kernel or cgroup limits are changed.")
         self.dashboard_note.setObjectName("muted"); layout.addWidget(self.dashboard_note)
         self.tabs.addTab(page, "Overview")
 
@@ -407,6 +502,58 @@ class NRGWindow(QMainWindow):
         self.process_note = QLabel("CPU is normalized to one logical core. RSS may double-count shared pages. Network traffic is system-wide; per-process network accounting is not available in this collector yet.")
         self.process_note.setObjectName("muted"); layout.addWidget(self.process_note)
         self.tabs.addTab(page,"Processes")
+
+    def _applications_tab(self):
+        page, layout = QWidget(), QVBoxLayout(); page.setLayout(layout)
+        self.applications_heading = QLabel("Application workloads · grouped by cgroup v2")
+        layout.addWidget(self.applications_heading)
+        self.applications_table = QTableWidget(0,7)
+        self.applications_table.setHorizontalHeaderLabels([
+            "Application / workload", "Processes", "CPU %", "Cgroup memory", "RSS sum", "Disk read / write", "Review"])
+        self.applications_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.applications_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.applications_table.setAlternatingRowColors(True)
+        self.applications_table.setSortingEnabled(True)
+        self.applications_table.horizontalHeader().setSectionResizeMode(0,QHeaderView.ResizeMode.Stretch)
+        for col in range(1,7):
+            self.applications_table.horizontalHeader().setSectionResizeMode(col,QHeaderView.ResizeMode.ResizeToContents)
+        self.applications_table.cellDoubleClicked.connect(self.open_application_processes)
+        self.applications_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.applications_table.customContextMenuRequested.connect(self.application_context_menu)
+        self.application_actions_button = QPushButton("Manage selected workload…")
+        self.application_actions_button.clicked.connect(self.show_application_actions)
+        action_row = QHBoxLayout(); action_row.addWidget(self.application_actions_button); action_row.addStretch()
+        layout.addLayout(action_row)
+        layout.addWidget(self.applications_table,1)
+        self.applications_note = QLabel(
+            "Cgroup memory is the preferred per-workload total. RSS sum can double-count shared pages. Double-click a workload to inspect its processes. Network traffic is not yet attributed per application.")
+        self.applications_note.setObjectName("muted"); layout.addWidget(self.applications_note)
+        self.tabs.addTab(page,"Applications")
+
+    def _history_tab(self):
+        page, layout = QWidget(), QVBoxLayout(); page.setLayout(layout)
+        row = QHBoxLayout()
+        self.history_heading = QLabel("Resource history · last 60 minutes")
+        self.history_refresh_button = QPushButton("Refresh history")
+        self.history_refresh_button.clicked.connect(self.refresh_history)
+        self.history_status = QLabel("Waiting for telemetry…"); self.history_status.setObjectName("muted")
+        row.addWidget(self.history_heading); row.addStretch(); row.addWidget(self.history_status); row.addWidget(self.history_refresh_button)
+        layout.addLayout(row)
+        scroll = QScrollArea(); scroll.setWidgetResizable(True)
+        content, charts_layout = QWidget(), QVBoxLayout()
+        content.setLayout(charts_layout)
+        self.history_charts = {
+            "memory": HistoryChart("Memory available and swap (GiB)"),
+            "pressure": HistoryChart("Pressure Stall Information (PSI %)"),
+            "workloads": HistoryChart("Largest application workloads (MiB)"),
+        }
+        for chart in self.history_charts.values():
+            charts_layout.addWidget(chart)
+        charts_layout.addStretch()
+        scroll.setWidget(content); layout.addWidget(scroll,1)
+        self.history_note = QLabel("History comes from the independent NRG monitor service. The GUI does not need to remain open to collect it.")
+        self.history_note.setObjectName("muted"); layout.addWidget(self.history_note)
+        self.tabs.addTab(page,"History")
 
     def _diagnostics_tab(self):
         page, layout = QWidget(), QVBoxLayout(); page.setLayout(layout)
@@ -597,7 +744,7 @@ class NRGWindow(QMainWindow):
         if not hasattr(self,"process_table"): return
         query=self.search.text().lower()
         rows=[p for p in self.processes if not query or query in " ".join(
-            (p["name"],str(p["pid"]),p["owner"],p["exe"])).lower()]
+            (p["name"],str(p["pid"]),p["owner"],p["exe"],p.get("cgroup", ""))).lower()]
         self.process_table.setSortingEnabled(False); self.process_table.setRowCount(min(MAX_ROWS,len(rows)))
         for row,proc in enumerate(rows[:MAX_ROWS]):
             values=[proc["name"],proc["pid"],f"{proc['cpu']:.1f}",fmt_bytes(proc["rss"]),
@@ -608,6 +755,171 @@ class NRGWindow(QMainWindow):
                 obj.setData(Qt.ItemDataRole.UserRole,(proc["pid"],proc["start"]))
                 self.process_table.setItem(row,col,obj)
         self.process_table.setSortingEnabled(True)
+        self.populate_applications_table()
+
+    @staticmethod
+    def _application_label(cgroup, fallback):
+        leaf = cgroup.rstrip("/").rsplit("/", 1)[-1] if cgroup else fallback
+        leaf = re.sub(r"^app-", "", leaf)
+        leaf = re.sub(r"@[0-9a-f]{12,}(?=\.service$)", "", leaf, flags=re.I)
+        leaf = re.sub(r"-[0-9]+(?=\.scope$)", "", leaf)
+        leaf = re.sub(r"\.(scope|service)$", "", leaf)
+        leaf = leaf.removeprefix("flatpak-")
+        if leaf.startswith("org.") and "." in leaf:
+            leaf = leaf.rsplit(".", 1)[-1]
+        return leaf.replace("-", " ").strip() or fallback
+
+    def populate_applications_table(self):
+        if not hasattr(self, "applications_table"):
+            return
+        groups = {}
+        for proc in self.processes:
+            cgroup = proc.get("cgroup", "")
+            key = cgroup or f"ungrouped/{proc['name']}"
+            item = groups.setdefault(key, {"cgroup": cgroup, "name": self._application_label(cgroup, proc["name"]),
+                "pids": [], "cpu": 0.0, "rss": 0, "read": 0.0, "write": 0.0, "score": 0})
+            item["pids"].append(proc["pid"])
+            item["cpu"] += proc["cpu"]
+            item["rss"] += proc["rss"]
+            item["read"] += proc["read_rate"]
+            item["write"] += proc["write_rate"]
+            item["score"] = max(item["score"], proc["score"])
+        ordered = sorted(groups.values(), key=lambda item: (item["score"], item["rss"]), reverse=True)
+        self.application_groups = {key: item for key, item in groups.items()}
+        self.applications_table.setSortingEnabled(False)
+        self.applications_table.setRowCount(len(ordered))
+        for row, item in enumerate(ordered):
+            cgroup_memory = None
+            if item["cgroup"] and ".." not in Path(item["cgroup"]).parts:
+                try:
+                    cgroup_memory = int((Path("/sys/fs/cgroup") / item["cgroup"].lstrip("/") / "memory.current").read_text())
+                except (OSError, ValueError):
+                    pass
+            values = [item["name"], len(item["pids"]), f"{item['cpu']:.1f}",
+                fmt_bytes(cgroup_memory) if cgroup_memory is not None else "—",
+                fmt_bytes(item["rss"]), f"{fmt_bytes(item['read'])}/s · {fmt_bytes(item['write'])}/s",
+                f"{item['score']} · Review" if item["score"] else "—"]
+            for col, value in enumerate(values):
+                obj = cell(value, Qt.AlignmentFlag.AlignRight|Qt.AlignmentFlag.AlignVCenter if col in (1,2,3,4,6) else None)
+                obj.setData(Qt.ItemDataRole.UserRole, item["cgroup"])
+                self.applications_table.setItem(row,col,obj)
+        self.applications_table.setSortingEnabled(True)
+
+    def open_application_processes(self, row, col):
+        item = self.applications_table.item(row, 0)
+        cgroup = item.data(Qt.ItemDataRole.UserRole) if item else ""
+        if not cgroup:
+            return
+        self.search.setText(cgroup)
+        self.tabs.setCurrentWidget(self.process_table.parentWidget())
+
+    def refresh_history(self):
+        samples = load_history_samples()
+        if not samples:
+            self.history_status.setText("No hay telemetría" if self.language == "es" else "No telemetry found")
+            for chart in self.history_charts.values(): chart.set_data({}, [])
+            return
+        times = [time.strftime("%H:%M", time.localtime(item["timestamp_unix_ms"] / 1000)) for item in samples]
+        memory = {
+            "Available RAM": [item.get("memory_available_bytes", 0) / 1024**3 for item in samples],
+            "Swap used": [item.get("swap_used_bytes", 0) / 1024**3 for item in samples],
+        }
+        pressure = {
+            "Memory some": [item.get("memory_psi_some_avg10", 0) for item in samples],
+            "Memory full": [item.get("memory_psi_full_avg10", 0) for item in samples],
+            "CPU full": [item.get("cpu_psi_full_avg10", 0) for item in samples],
+            "I/O full": [item.get("io_psi_full_avg10", 0) for item in samples],
+        }
+        latest = samples[-1].get("workloads", [])
+        top_names = [w.get("name", "") for w in sorted(
+            latest, key=lambda item: item.get("memory_current_bytes") or 0, reverse=True)[:4]]
+        workloads = {}
+        for name in top_names:
+            workloads[name.split("@", 1)[0][:22]] = [
+                next((w.get("memory_current_bytes", 0) / 1024**2 for w in item.get("workloads", []) if w.get("name") == name), 0)
+                for item in samples
+            ]
+        self.history_charts["memory"].set_data(memory, times)
+        self.history_charts["pressure"].set_data(pressure, times)
+        self.history_charts["workloads"].set_data(workloads, times)
+        first = time.strftime("%H:%M", time.localtime(samples[0]["timestamp_unix_ms"] / 1000))
+        last = time.strftime("%H:%M", time.localtime(samples[-1]["timestamp_unix_ms"] / 1000))
+        self.history_status.setText(
+            f"{len(samples)} muestras · {first}–{last}" if self.language == "es"
+            else f"{len(samples)} samples · {first}–{last}")
+
+    def application_context_menu(self, position):
+        index = self.applications_table.indexAt(position)
+        if index.isValid():
+            self.applications_table.selectRow(index.row())
+        self.show_application_actions(self.applications_table.viewport().mapToGlobal(position))
+
+    def show_application_actions(self, global_position=None):
+        row = self.applications_table.currentRow()
+        if row < 0:
+            QMessageBox.information(self, "NRG", "Select an application workload first.")
+            return
+        item = self.applications_table.item(row, 0)
+        cgroup = item.data(Qt.ItemDataRole.UserRole) if item else ""
+        group = self.application_groups.get(cgroup)
+        if not group:
+            return
+        menu = QMenu(self)
+        actions = [
+            ("Suspend workload (STOP)", signal.SIGSTOP),
+            ("Continue workload (CONT)", signal.SIGCONT),
+            ("Terminate workload (TERM)…", signal.SIGTERM),
+            ("Force kill workload (KILL)…", signal.SIGKILL),
+        ]
+        for label, sig in actions:
+            action = menu.addAction(label if self.language == "en" else
+                label.replace("Suspend", "Suspender").replace("Continue", "Continuar")
+                     .replace("Terminate", "Terminar").replace("Force kill", "Forzar cierre"))
+            action.triggered.connect(lambda checked=False, cg=cgroup, sg=sig: self.send_application_signal(cg, sg))
+        if global_position is None:
+            global_position = self.mapToGlobal(self.rect().center())
+        menu.exec(global_position)
+
+    def send_application_signal(self, cgroup, sig):
+        group = self.application_groups.get(cgroup)
+        if not group:
+            return
+        destructive = sig in (signal.SIGTERM, signal.SIGKILL)
+        if destructive:
+            name = "SIGKILL" if sig == signal.SIGKILL else "SIGTERM"
+            answer = QMessageBox.warning(
+                self, f"Confirm {name}",
+                f"Send {name} to {group['name']} ({len(group['pids'])} processes)? Unsaved work may be lost.",
+                QMessageBox.StandardButton.Cancel | QMessageBox.StandardButton.Yes,
+                QMessageBox.StandardButton.Cancel,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+        sent, skipped = 0, 0
+        for pid in list(group["pids"]):
+            proc = self.process_rows.get(pid)
+            if not proc:
+                skipped += 1
+                continue
+            pidfd = None
+            try:
+                self._validate_process_identity(proc, expected_cgroup=cgroup)
+                if hasattr(os, "pidfd_open") and hasattr(signal, "pidfd_send_signal"):
+                    pidfd = os.pidfd_open(pid, 0)
+                    self._validate_process_identity(proc, expected_cgroup=cgroup)
+                    signal.pidfd_send_signal(pidfd, sig)
+                else:
+                    self._validate_process_identity(proc, expected_cgroup=cgroup)
+                    os.kill(pid, sig)
+                sent += 1
+            except (OSError, ValueError, ProcessLookupError, PermissionError):
+                skipped += 1
+            finally:
+                if pidfd is not None:
+                    os.close(pidfd)
+        self.live.setText(
+            f"{signal.Signals(sig).name}: {sent} sent, {skipped} skipped · {group['name']}"
+        )
 
     def process_context_menu(self, position):
         index = self.process_table.indexAt(position)
@@ -661,7 +973,7 @@ class NRGWindow(QMainWindow):
             protected.add(parent); current = parent
         return pid in protected
 
-    def _validate_process_identity(self, proc):
+    def _validate_process_identity(self, proc, expected_cgroup=None):
         pid = int(proc["pid"])
         if self._protected_process(pid):
             raise PermissionError("NRG refuses to control PID 1 or one of its own ancestor processes.")
@@ -673,6 +985,14 @@ class NRGWindow(QMainWindow):
             raise ProcessLookupError(f"Process {pid} no longer exists or cannot be inspected.") from exc
         if current_start != int(proc["start"]):
             raise ProcessLookupError("The PID was reused; the selected process identity changed. Refresh and select it again.")
+        if expected_cgroup is not None:
+            try:
+                current_cgroup = next((line.split("::", 1)[1] for line in Path(f"/proc/{pid}/cgroup").read_text().splitlines()
+                                       if line.startswith("0::")), "")
+            except OSError as exc:
+                raise ProcessLookupError("The process cgroup could not be revalidated.") from exc
+            if current_cgroup != expected_cgroup:
+                raise ProcessLookupError("The process moved to another workload; refresh the application list.")
         return pid
 
     def send_process_signal(self, proc, sig):
@@ -920,13 +1240,11 @@ class NRGWindow(QMainWindow):
         }
         for key, label in self.metric_title_labels.items(): label.setText(tr(*titles[key]))
         self.alert_heading.setText(tr("Processes that deserve a closer look", "Procesos que requieren revisión"))
-        self.dashboard_note.setText(tr("Read-only monitoring. No process is terminated and no kernel/cgroup setting is changed.",
-            "Monitorización de solo lectura. No termina procesos ni modifica el kernel o los cgroups."))
+        self.dashboard_note.setText(tr(
+            "System telemetry is read-only by default. Process controls require an explicit selection; no kernel or cgroup limits are changed.",
+            "La telemetría es de solo lectura por defecto. El control de procesos requiere selección explícita; no se modifican kernel ni límites cgroup."))
         self.alert_table.setHorizontalHeaderLabels([tr("Process", "Proceso"), "PID", tr("Signal", "Señal"), tr("Executable", "Ejecutable")])
         self.search.setPlaceholderText(tr("Filter by process, PID, owner or executable…", "Filtrar por proceso, PID, propietario o ejecutable…"))
-        self.process_table.setHorizontalHeaderLabels([tr("Process", "Proceso"), "PID", "CPU %", "RAM", tr("Owner", "Propietario"), tr("I/O write", "Escritura E/S"), tr("Review", "Revisión")])
-        self.process_note.setText(tr("CPU is normalized to one logical core (100% = one full core). RSS estimates can double-count shared pages.",
-            "CPU se expresa por núcleo lógico (100% = un núcleo completo). RSS puede contar páginas compartidas más de una vez."))
         self.profile_label.setText(tr("Profile", "Perfil"))
         self.plan_button.setText(tr("Calculate memory plan", "Calcular plan de memoria"))
         self.diag_button.setText(tr("Run system diagnosis", "Ejecutar diagnóstico del sistema"))
@@ -935,6 +1253,28 @@ class NRGWindow(QMainWindow):
         self.plan_table.setHorizontalHeaderLabels([tr("Application", "Aplicación"), tr("Priority", "Prioridad"), tr("Current", "Actual"), tr("Proposed soft ceiling", "Techo flexible propuesto"), tr("Samples", "Muestras")])
         self.diag_output.setPlaceholderText(tr("System diagnosis output appears here.", "El diagnóstico del sistema aparecerá aquí."))
         self.process_actions_button.setText(tr("Manage selected process…", "Administrar proceso seleccionado…"))
+        self.tabs.setTabText(1, tr("Processes", "Procesos"))
+        self.tabs.setTabText(2, tr("Applications", "Aplicaciones"))
+        self.tabs.setTabText(3, tr("History", "Historial"))
+        self.tabs.setTabText(4, tr("Diagnosis & Profiles", "Diagnóstico y perfiles"))
+        self.history_heading.setText(tr("Resource history · last 60 minutes", "Historial de recursos · últimos 60 minutos"))
+        self.history_refresh_button.setText(tr("Refresh history", "Actualizar historial"))
+        self.history_note.setText(tr(
+            "History comes from the independent NRG monitor service. The GUI does not need to remain open to collect it.",
+            "El historial lo genera el servicio independiente de NRG. La interfaz no necesita permanecer abierta para recopilar datos."))
+        self.history_charts["memory"].title = tr("Memory available and swap (GiB)", "RAM disponible e intercambio (GiB)")
+        self.history_charts["pressure"].title = tr("Pressure Stall Information (PSI %)", "Presión del sistema (PSI %)")
+        self.history_charts["workloads"].title = tr("Largest application workloads (MiB)", "Aplicaciones con mayor consumo (MiB)")
+        for chart in self.history_charts.values(): chart.update()
+        self.applications_heading.setText(tr("Application workloads · grouped by cgroup v2", "Aplicaciones · agrupadas por cgroup v2"))
+        self.applications_table.setHorizontalHeaderLabels([
+            tr("Application / workload", "Aplicación / carga"), tr("Processes", "Procesos"), "CPU %",
+            tr("Cgroup memory", "Memoria cgroup"), "RSS sum", tr("Disk read / write", "Lectura / escritura"),
+            tr("Review", "Revisar")])
+        self.application_actions_button.setText(tr("Manage selected workload…", "Administrar carga seleccionada…"))
+        self.applications_note.setText(tr(
+            "Cgroup memory is the preferred per-workload total. RSS sum can double-count shared pages. Double-click a workload to inspect its processes. Network traffic is not yet attributed per application.",
+            "La memoria cgroup es la medida preferida por carga. La suma RSS puede contar páginas compartidas varias veces. Doble clic para inspeccionar procesos. La red aún no se atribuye por aplicación."))
         self.security_toggle.setText(tr("Enable anomaly / security monitoring", "Activar monitoreo de anomalías / seguridad"))
         self.security_toggle.setChecked(self.security_enabled)
         self.process_table.setHorizontalHeaderLabels(
