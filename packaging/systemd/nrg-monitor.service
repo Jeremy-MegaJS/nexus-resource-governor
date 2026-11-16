@@ -1,0 +1,31 @@
+[Unit]
+Description=Nexus Resource Governor - lightweight notification monitor
+After=graphical-session.target
+Wants=graphical-session.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/Projects/nexus-resource-governor
+ExecStart=%h/Projects/nexus-resource-governor/target/release/nrg-agent --monitor 2000
+Restart=on-failure
+RestartSec=3
+UMask=0077
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+PrivateTmp=yes
+LockPersonality=yes
+RestrictSUIDSGID=yes
+ReadWritePaths=%h/.local/state/nrg
+Environment=HOME=%h
+Environment=XDG_CONFIG_HOME=%h/.config
+Environment=XDG_STATE_HOME=%h/.local/state
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=%t/bus
+Environment=XDG_RUNTIME_DIR=%t
+StandardOutput=null
+StandardError=journal
+
+[Install]
+WantedBy=default.target

@@ -1,6 +1,6 @@
 # Nexus Resource Governor — Roadmap
 
-The project is in the requirements and architecture phase. The order prioritizes trustworthy measurement and safe recovery before enforcement.
+The project currently has a read-only Linux telemetry backend and a policy/Rescue Mode simulator. Controlled enforcement, the desktop UI, and the Windows backend are not implemented. The order prioritizes trustworthy measurement and safe recovery before enforcement.
 
 ## Phase 0 — Requirements and architecture
 - [x] Define Linux-first, Windows-planned strategy.
@@ -15,7 +15,13 @@ The project is in the requirements and architecture phase. The order prioritizes
 - [x] Add read-only Linux snapshot CLI for physical memory, swap, zram, memory PSI, selected vmstat counters, and current cgroup v2 metrics.
 - [x] Add parser tests and safe cgroup-path validation.
 - [x] Add JSONL watch mode with per-sample flush for pressure/freeze correlation.
-- [x] Add CPU/I/O PSI, bounded IRQ counters, DRM driver and connector identity, thermal zones, filtered kernel and desktop-session journal events from the current and three preceding boots, and a read-only freeze triage view.
+- [x] Add a lightweight watch path that skips per-process /proc attribution.
+- [x] Add notification-only application discovery, per-workload memory warning/critical thresholds, pressure escalation, and OOM-kill delta alerts with hysteresis.
+- [x] Add compact 10-second local history with bounded 8 MiB rotation and private file permissions.
+- [x] Package and enable a user-scoped, read-only notification monitor service for Arch/Linux.
+- [x] Expose kernel OOM-kill and direct-reclaim counters plus per-workload cgroup high/oom/oom_kill event totals.
+- [x] Read Linux overcommit mode and avoid treating Committed_AS / CommitLimit as a strict admission ratio unless overcommit mode is 2.
+- [x] Add CPU/I/O PSI, bounded IRQ counters, DRM driver and connector identity, thermal zones, CPU thermal-throttle counters and delta alerts, filtered kernel and desktop-session journal events from the current and three preceding boots, and a read-only freeze triage view.
 - [x] Detect cgroup v2 controllers, child-controller enablement, and current-cgroup subtree-control write access (read-only probe; delegation is not assumed).
 - [x] Collect per-workload memory, CPU, process-count, and I/O counters from user cgroup slices.
 - [x] Discover workloads from the per-user systemd cgroup hierarchy, independent of whether NRG runs in `app.slice`.
@@ -26,7 +32,7 @@ The project is in the requirements and architecture phase. The order prioritizes
 - [x] Expose a bounded `/proc/PID/exe` target path alongside executable basename as an additional identity hint; do not collect command-line arguments.
 - [x] Aggregate a bounded, deterministic inventory of executable paths observed in each sampled workload; keep it explicitly as identity hints, not an asserted app identity.
 - [ ] Add GPU engine/reset telemetry where exposed.
-- [ ] Provide a stable sampling API and bounded local history.
+- [ ] Provide a stable sampling API for external clients.
 - [ ] Improve application identity beyond cgroup membership and executable metadata using confidence-scored, non-secret signals.
 - [ ] Validate metrics against system tools under normal and stressed workloads.
 
@@ -35,15 +41,21 @@ The project is in the requirements and architecture phase. The order prioritizes
 ## Phase 2 — Policy engine and simulator
 - [x] Define a first portable policy input using normalized Linux telemetry.
 - [x] Implement deterministic early OOM-risk evaluation and dry-run Rescue Mode planning.
+- [x] Add a deterministic dry-run adaptive memory-budget planner using bounded per-app P95 history, system reserve, and named workload profiles.
 - [ ] Define persistent workload identities, configurable budgets, and backend capabilities.
-- [ ] Add normal, gaming/performance, and battery-conscious profiles.
+- [x] Add initial balanced, gaming, study, and development priority profiles to the dry-run planner.
+- [ ] Add user-editable profile definitions and battery-conscious profile.
 - [ ] Implement admission-control simulation.
+- [x] Refuse to propose soft limits when current-use safety floors exceed the allocatable budget or captured hard limits conflict.
 - [ ] Add hysteresis, cooldowns, and degraded-mode behavior.
 - [ ] Replay captured telemetry to test decisions without enforcement.
-- [ ] Add per-workload soft/warning budgets and expiring temporary overrides.
-- [ ] Add explicit save/close adapter protocol and user-confirmed Rescue Mode workflow.
+- [ ] Add persisted workload identities and configurable long-lived budgets; current per-app thresholds are notification-only.
+- [x] Model expiring Rescue Mode budget overrides, capture original per-workload memory.high/memory.max, and emit a restore plan (dry-run only).
+- [x] Add a save-attestation/adapter-verification state machine with separate pause/close approval gates (no application adapters are registered yet).
+- [x] Record before/after memory.current deltas as observations without claiming causality.
+- [ ] Implement a real adapter registry and user-facing save/close workflow.
 
-**Exit criteria:** the same input snapshot and policy always produce the same explainable decision. Current first pass: deterministic OOM guard and dry-run rescue planner; no enforcement.
+**Exit criteria:** the same input snapshot and policy always produce the same explainable decision. Current implementation includes a deterministic OOM guard, transaction-shaped Rescue Mode simulator, and a profile-aware adaptive budget planner; these do not write cgroups, signal processes, pause/close applications, or enforce budgets.
 
 ## Phase 3 — Linux controlled enforcement
 - [ ] Create managed workload scopes.

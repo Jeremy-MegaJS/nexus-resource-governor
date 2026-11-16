@@ -4,7 +4,7 @@
 
 NRG monitors system and application resource usage, predicts resource pressure, and applies graduated, user-configurable policies to keep the operating system responsive without unexpectedly terminating important work.
 
-> **Status:** Linux telemetry prototype plus a deterministic, read-only policy evaluator and Rescue Mode planner. No resource-control actions are applied yet.
+> **Status:** Linux telemetry monitor, deterministic adaptive memory-budget planner, and Rescue Mode simulator. Resource-control enforcement is still disabled.
 
 ## Why NRG exists
 
@@ -97,7 +97,7 @@ The first implementation is a read-only Rust CLI. It currently samples:
 - Physical memory and swap from /proc/meminfo.
 - Memory, CPU, and I/O PSI from /proc/pressure.
 - Bounded interrupt counters for IRQ 27 and selected graphics/storage/input drivers.
-- DRM device/driver identity, connector status/modes, KScreen userspace output state and DPMS mode, and thermal-zone readings (no GPU engine utilization claim).
+- DRM device/driver identity, connector status/modes, KScreen userspace output state and DPMS mode, thermal-zone readings, and CPU core/package thermal-throttle counters with delta-based monitor alerts (no GPU engine utilization claim).
 - Filtered, bounded kernel and user-session journal events from the current boot and three preceding boots, including KWin/Plasma/XWayland/EGL messages when journal access is available.
 - ZRAM compression and physical-memory accounting from sysfs.
 - Selected paging and reclaim counters from /proc/vmstat.
@@ -105,17 +105,22 @@ The first implementation is a read-only Rust CLI. It currently samples:
 - cgroup v2 controller availability, child-controller enablement, and a non-mutating write-open probe for the current cgroup (not a guarantee of systemd delegation).
 - Per-workload cgroup memory, CPU, process-count, and I/O counters from user application, session, and background slices.
 
-The watch mode emits one JSON snapshot per line and flushes each sample, making it useful for correlating resource pressure with freezes. Schema version 9 adds CPU/I/O PSI, bounded IRQ counters (including IRQ 27 when exposed), DRM driver identity and connector state, and thermal-zone readings. The --diagnose command presents these signals together with bounded relevant kernel and desktop-session events from the current boot and three preceding boots, without changing system state. It cannot yet identify GPU engine hangs directly or infer that an IRQ is disabled from counters alone. The policy evaluator adds an early OOM-risk guard with NORMAL / WATCH / PRESSURE / CRITICAL states. Rescue Mode can generate a dry-run plan for a target application and requested temporary headroom, ranking other user applications that could be offered for save-and-close/pause.
+The lightweight watch mode emits one JSON snapshot per line and flushes each sample, without scanning every process. It sends desktop notifications (requests a 10-second expiry) when it detects a new application workload, when an app crosses its warning or critical memory budget, when system pressure escalates, and when OOM/reclaim events occur. The default polling interval is 2 seconds. The notification-only --monitor mode runs silently and stores a compact sample every 10 seconds in ~/.local/state/nrg/telemetry.jsonl. Retention is bounded to 8 MiB plus one rotated 8 MiB backup; directories/files use private permissions. History contains no PIDs, command lines, or raw journal text. The --watch-full mode opts into more expensive per-process attribution. Per-app notification thresholds can be overridden in ~/.config/nrg/budgets.conf; initialize it with mkdir -p ~/.config/nrg && cp config/budgets.example.conf ~/.config/nrg/budgets.conf. These are warning thresholds only, not enforced cgroup limits. Schema version 14 includes per-workload cgroup memory.high/memory.max snapshots and CPU thermal-throttling counters; the lightweight monitor skips process attribution but records throttle deltas. OOM-kill/direct-reclaim counters and Linux overcommit mode are included. Commit usage is compared with CommitLimit only in strict overcommit mode 2; in modes 0/1 the ratio is not a reliable OOM predictor. The --diagnose command correlates memory/CPU/I/O pressure, IRQ, display, thermal, and bounded kernel/desktop journal events from the current and three preceding boots. It cannot yet identify GPU engine hangs directly or infer that an IRQ is disabled from counters alone.
 
 These policy commands are currently advisory only:
 
 ```sh
 cargo run -- --policy
+cargo run -- --budget-plan gaming
+cargo run -- --budget-plan study
 cargo run -- --diagnose
 cargo run -- --rescue-plan brave 512
+cargo run -- --rescue-transaction brave 512 300
 ```
 
-`--rescue-plan` takes a case-insensitive workload-name fragment and extra MiB requested by the priority workload. It reports the estimated shortfall and candidate applications, but does not change cgroups, raise limits, suspend, or close anything. Cgroup memory usage is not guaranteed reclaimable memory. Application state can only be saved through a supported application adapter or by the user. Automatic process termination is prohibited by the policy engine.
+`--budget-plan [balanced|gaming|study|development]` calculates profile-aware per-app soft-memory proposals from bounded historical P95 samples, current usage, and a system reserve. New apps receive a conservative bootstrap estimate until at least five samples exist. The planner prioritizes workloads by profile, preserves the captured memory.max, and refuses to propose limits if current-use safety floors cannot fit. It is dry-run only; no cgroup values are written. User-editable profiles and live enforcement are not implemented yet.
+
+`--rescue-plan` takes a case-insensitive workload-name fragment and extra MiB requested by the priority workload. `--rescue-transaction TARGET EXTRA_MIB [TTL_SECONDS]` (30–900 seconds; default 300) emits a transaction-shaped dry-run: it captures the target's previous `memory.high`/`memory.max`, proposes a soft `memory.high` only when a numeric prior value exists, records an expiry and restore plan, and models save verification plus separate pause/close approval. No cgroup values are written and no process is controlled. `memory.max` is never proposed for change. No application adapters are registered yet; a user attestation is not an application-confirmed save. Before/after `memory.current` is an observed delta, not proof that a particular action caused the decrease. Pausing a process does not itself free resident memory. Target delegation and ancestor limits are not yet validated, so enforcement remains disabled. The Linux kernel remains responsible for reclaiming file cache and swapping anonymous pages; NRG does not route allocations directly to swap. The Windows backend is not implemented.
 
 Build and run on Linux:
 
@@ -123,7 +128,15 @@ Build and run on Linux:
 cargo test
 cargo run -- --human
 cargo run -- --json
-cargo run -- --watch 1000 >> nrg-session.jsonl
+cargo run --release -- --monitor 2000
+# Install the user-session monitor at login:
+install -Dm644 packaging/systemd/nrg-monitor.service ~/.config/systemd/user/nrg-monitor.service
+systemctl --user daemon-reload
+systemctl --user enable --now nrg-monitor.service
+# Stream lightweight JSONL manually when correlating a freeze:
+cargo run --release -- --watch 2000 >> nrg-session.jsonl
+# More expensive process-attribution sampling:
+cargo run --release -- --watch-full 5000 >> nrg-session-full.jsonl
 ```
 
 ## Development

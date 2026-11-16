@@ -5,7 +5,7 @@ use serde::Serialize;
 const MIB: u64 = 1024 * 1024;
 const GIB: u64 = 1024 * MIB;
 
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub(crate) enum PressureState {
     Normal,
@@ -21,6 +21,19 @@ pub(crate) struct OomGuard {
     pub(crate) reserve_target_bytes: u64,
     pub(crate) psi_some_avg10: Option<f64>,
     pub(crate) psi_full_avg10: Option<f64>,
+    pub(crate) swap_used_bytes: Option<u64>,
+    pub(crate) swap_total_bytes: Option<u64>,
+    pub(crate) swap_used_percent: Option<f64>,
+    pub(crate) committed_bytes: Option<u64>,
+    pub(crate) commit_limit_bytes: Option<u64>,
+    pub(crate) overcommit_mode: Option<u64>,
+    pub(crate) commit_used_percent: Option<f64>,
+    pub(crate) kernel_oom_kill_events_since_boot: Option<u64>,
+    pub(crate) cgroup_oom_events_total: u64,
+    pub(crate) cgroup_oom_kill_events_total: u64,
+    pub(crate) cgroup_high_events_total: u64,
+    pub(crate) direct_reclaim_scans_since_boot: Option<u64>,
+    pub(crate) direct_alloc_stalls_since_boot: Option<u64>,
     pub(crate) recommended_response: &'static str,
     pub(crate) automatic_termination_allowed: bool,
 }
@@ -39,6 +52,8 @@ pub(crate) struct RescueCandidate {
 pub(crate) struct RescuePlan {
     pub(crate) mode: &'static str,
     pub(crate) target: String,
+    pub(crate) target_found: bool,
+    pub(crate) target_is_protected: bool,
     pub(crate) target_current_bytes: Option<u64>,
     pub(crate) requested_extra_bytes: u64,
     pub(crate) system_available_bytes: Option<u64>,
@@ -61,6 +76,39 @@ pub(crate) fn evaluate(snapshot: &Snapshot) -> PolicyReport {
     let reserve = (total / 4).clamp(512 * MIB, 2 * GIB);
     let some = snapshot.pressure.some.as_ref().and_then(|p| p.avg10);
     let full = snapshot.pressure.full.as_ref().and_then(|p| p.avg10);
+    let swap_used = snapshot.memory.swap_used_bytes;
+    let swap_total = snapshot.memory.swap_total_bytes;
+    let swap_used_percent = match (swap_used, swap_total) {
+        (Some(used), Some(total)) if total > 0 => Some(used as f64 * 100.0 / total as f64),
+        _ => None,
+    };
+    let committed = snapshot.memory.committed_bytes;
+    let commit_limit = snapshot.memory.commit_limit_bytes;
+    let overcommit_mode = snapshot.memory.overcommit_mode;
+    // CommitLimit is a strict admission boundary only in overcommit mode 2.
+    // In modes 0/1, Committed_AS can legitimately exceed it and is informational.
+    let commit_used_percent = match (committed, commit_limit, overcommit_mode) {
+        (Some(used), Some(limit), Some(2)) if limit > 0 => Some(used as f64 * 100.0 / limit as f64),
+        _ => None,
+    };
+    let cgroup_oom_events_total = snapshot
+        .workloads
+        .iter()
+        .map(|w| w.memory_events.get("oom").copied().unwrap_or(0))
+        .sum();
+    let cgroup_oom_kill_events_total = snapshot
+        .workloads
+        .iter()
+        .map(|w| w.memory_events.get("oom_kill").copied().unwrap_or(0))
+        .sum();
+    let cgroup_high_events_total = snapshot
+        .workloads
+        .iter()
+        .map(|w| w.memory_events.get("high").copied().unwrap_or(0))
+        .sum();
+    let direct_reclaim_scans_since_boot = snapshot.vmstat.get("pgscan_direct").copied();
+    let direct_alloc_stalls_since_boot = snapshot.vmstat.get("allocstall").copied();
+    let kernel_oom_kill_events_since_boot = snapshot.vmstat.get("oom_kill").copied();
     let state = if available.is_some_and(|v| v < 384 * MIB) || full.is_some_and(|v| v >= 2.0) {
         PressureState::Critical
     } else if available.is_some_and(|v| v < reserve / 2) || full.is_some_and(|v| v >= 0.5) {
@@ -87,6 +135,19 @@ pub(crate) fn evaluate(snapshot: &Snapshot) -> PolicyReport {
             reserve_target_bytes: reserve,
             psi_some_avg10: some,
             psi_full_avg10: full,
+            swap_used_bytes: swap_used,
+            swap_total_bytes: swap_total,
+            swap_used_percent,
+            committed_bytes: committed,
+            commit_limit_bytes: commit_limit,
+            overcommit_mode,
+            commit_used_percent,
+            kernel_oom_kill_events_since_boot,
+            cgroup_oom_events_total,
+            cgroup_oom_kill_events_total,
+            cgroup_high_events_total,
+            direct_reclaim_scans_since_boot,
+            direct_alloc_stalls_since_boot,
             recommended_response: response,
             automatic_termination_allowed: false,
         },
@@ -94,11 +155,39 @@ pub(crate) fn evaluate(snapshot: &Snapshot) -> PolicyReport {
     }
 }
 
+pub(crate) fn is_protected_workload_name(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    [
+        "remote-desktop-commander",
+        "chatgpt",
+        "openai",
+        "codex",
+        "agy",
+        "alacritty",
+        "konsole",
+        "kwin",
+        "plasma",
+        "pipewire",
+        "wireplumber",
+        "dbus",
+        "polkit",
+        "scrcnexus",
+        "nrg-agent",
+    ]
+    .iter()
+    .any(|protected| name.contains(protected))
+}
+
 pub(crate) fn rescue_plan(snapshot: &Snapshot, target_query: &str, extra_mib: u64) -> RescuePlan {
-    let target = snapshot
-        .workloads
-        .iter()
-        .find(|w| w.name.to_lowercase().contains(&target_query.to_lowercase()));
+    let target = snapshot.workloads.iter().find(|w| {
+        w.slice == "app.slice"
+            && w.name
+                .to_ascii_lowercase()
+                .contains(&target_query.to_ascii_lowercase())
+    });
+    let target_found = target.is_some();
+    let target_is_protected =
+        target.is_some_and(|workload| is_protected_workload_name(&workload.name));
     let target_name = target
         .map(|w| w.name.clone())
         .unwrap_or_else(|| target_query.to_owned());
@@ -114,13 +203,15 @@ pub(crate) fn rescue_plan(snapshot: &Snapshot, target_query: &str, extra_mib: u6
         .cgroup_v2
         .as_ref()
         .map(|c| format!("/sys/fs/cgroup{}", c.path));
-    let mut candidates: Vec<_> = snapshot.workloads.iter().filter(|w| {
+    let mut candidates: Vec<_> = snapshot
+        .workloads
+        .iter()
+        .filter(|_| shortfall > 0)
+        .filter(|w| {
         if w.name == target_name || w.slice != "app.slice" { return false; }
         if current_cgroup_path.as_deref() == Some(w.path.as_str()) { return false; }
-        let n = w.name.to_lowercase();
         // Protect desktop/session infrastructure and the governor itself.
-        !["remote-desktop-commander", "kwin", "plasma", "pipewire", "wireplumber", "dbus", "polkit", "scrcnexus", "nrg-agent"]
-            .iter().any(|protected| n.contains(protected))
+        !is_protected_workload_name(&w.name)
     }).filter_map(|w| {
         let current = w.memory_current_bytes?;
         if current < 128 * MIB { return None; }
@@ -132,6 +223,8 @@ pub(crate) fn rescue_plan(snapshot: &Snapshot, target_query: &str, extra_mib: u6
     RescuePlan {
         mode: "DRY_RUN_ONLY",
         target: target_name,
+        target_found,
+        target_is_protected,
         target_current_bytes: target_current,
         requested_extra_bytes: requested,
         system_available_bytes: available,
@@ -154,9 +247,10 @@ mod tests {
     fn fixture(available: u64) -> Snapshot {
         use crate::linux::{Memory, Pressure, PsiLine};
         Snapshot {
-            schema_version: 9,
+            schema_version: 14,
             timestamp_unix_ms: 0,
             platform: "linux",
+            process_details_collected: false,
             memory: Memory {
                 total_bytes: Some(8 * GIB),
                 available_bytes: Some(available),
@@ -170,6 +264,7 @@ mod tests {
                 swap_used_bytes: None,
                 committed_bytes: None,
                 commit_limit_bytes: None,
+                overcommit_mode: Some(0),
             },
             pressure: Pressure {
                 some: Some(PsiLine {
@@ -197,6 +292,7 @@ mod tests {
             graphics: Vec::new(),
             display_connectors: Vec::new(),
             thermal_zones: Vec::new(),
+            cpu_thermal_throttle: None,
             zram: None,
             vmstat: Default::default(),
             cgroup_v2: None,
@@ -223,12 +319,14 @@ mod tests {
     #[test]
     fn rescue_plan_excludes_decoded_protected_workloads() {
         use crate::linux::WorkloadSnapshot;
-        let mut snapshot = fixture(3 * GIB);
+        let mut snapshot = fixture(GIB);
         let workload = |slice: &str, name: &str, memory: u64| WorkloadSnapshot {
             slice: slice.to_owned(),
             name: name.to_owned(),
             path: format!("/sys/fs/cgroup/user.slice/{slice}/{name}"),
             memory_current_bytes: Some(memory),
+            memory_high_limit: Some("max".to_owned()),
+            memory_max_limit: Some("max".to_owned()),
             memory_anon_bytes: None,
             memory_file_bytes: None,
             cpu_usage_usec: None,
@@ -249,6 +347,7 @@ mod tests {
                 600 * MIB,
             ),
             workload("session.slice", "plasma-kwin_wayland.service", 500 * MIB),
+            workload("app.slice", "app-chatgpt.service", 700 * MIB),
             workload("app.slice", "app-editor.service", 400 * MIB),
         ];
         let plan = rescue_plan(&snapshot, "editor", 512);
@@ -259,6 +358,56 @@ mod tests {
                 .iter()
                 .any(|candidate| candidate.workload.contains("Remote-Desktop-Commander"))
         );
+    }
+
+    #[test]
+    fn commit_ratio_is_only_a_strict_limit_signal_in_overcommit_mode_two() {
+        let mut snapshot = fixture(3 * GIB);
+        snapshot.memory.committed_bytes = Some(9 * GIB);
+        snapshot.memory.commit_limit_bytes = Some(8 * GIB);
+        snapshot.memory.overcommit_mode = Some(0);
+        assert_eq!(evaluate(&snapshot).oom_guard.commit_used_percent, None);
+        snapshot.memory.overcommit_mode = Some(2);
+        assert_eq!(
+            evaluate(&snapshot).oom_guard.commit_used_percent,
+            Some(112.5)
+        );
+    }
+
+    #[test]
+    fn oom_guard_exposes_kernel_and_workload_oom_counters() {
+        use crate::linux::WorkloadSnapshot;
+        let mut snapshot = fixture(3 * GIB);
+        snapshot.vmstat.insert("oom_kill".to_owned(), 3);
+        let mut workload = WorkloadSnapshot {
+            slice: "app.slice".to_owned(),
+            name: "app-test.service".to_owned(),
+            path: "/test".to_owned(),
+            memory_current_bytes: Some(256 * MIB),
+            memory_high_limit: Some("max".to_owned()),
+            memory_max_limit: Some("max".to_owned()),
+            memory_anon_bytes: None,
+            memory_file_bytes: None,
+            cpu_usage_usec: None,
+            pids_current: Some(1),
+            io_read_bytes: 0,
+            io_write_bytes: 0,
+            memory_events: Default::default(),
+            process_count_observed: 0,
+            top_processes: Vec::new(),
+            process_tree: Vec::new(),
+            process_tree_truncated: false,
+            executable_hints: Vec::new(),
+        };
+        workload.memory_events.insert("oom".to_owned(), 2);
+        workload.memory_events.insert("oom_kill".to_owned(), 1);
+        workload.memory_events.insert("high".to_owned(), 4);
+        snapshot.workloads.push(workload);
+        let report = evaluate(&snapshot).oom_guard;
+        assert_eq!(report.kernel_oom_kill_events_since_boot, Some(3));
+        assert_eq!(report.cgroup_oom_events_total, 2);
+        assert_eq!(report.cgroup_oom_kill_events_total, 1);
+        assert_eq!(report.cgroup_high_events_total, 4);
     }
 
     #[test]

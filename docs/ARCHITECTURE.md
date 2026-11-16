@@ -158,9 +158,9 @@ Prefer systemd-managed scopes/slices where feasible so ownership and cleanup are
 - Never run the whole desktop UI or remote-control service as root.
 - Track every applied value and restore it on policy removal, shutdown, or backend recovery.
 
-## 8. Windows backend
+## 8. Windows backend — not implemented
 
-The Windows backend implements the same policy interface using native APIs:
+There is currently no Windows telemetry, policy-enforcement, or Job Object backend. The following is a future design direction, not available functionality:
 - Job Objects for grouping a process tree and applying supported job limits.
 - Process and system memory APIs for telemetry.
 - CPU and I/O controls where Windows exposes reliable equivalents.
@@ -224,15 +224,15 @@ The first policy implementation is deliberately read-only. It evaluates availabl
 
 Rescue Mode accepts a priority workload and a requested temporary headroom amount. It calculates the current shortfall against the reserve target and ranks other user application cgroups as possible candidates for a user-approved save/close or pause. Reported cgroup usage is only an upper bound: it is not a prediction of reclaimable memory. The collector's own cgroup and desktop/session infrastructure are excluded from candidate selection.
 
-The next implementation must replace this advisory plan with a transaction-like workflow: confirm the target and candidates, request save through an application adapter or direct user action, verify the save result where possible, apply a scoped and expiring budget override, monitor the temporary window, and restore prior values. If the application cannot confirm save, NRG must say so and must not close it automatically.
+The transaction-shaped simulator now captures the target workload's original `memory.high` and `memory.max`, computes a proposed soft `memory.high` only when the current value is numeric, attaches a bounded expiry, and emits an explicit restore plan. It models candidate selection, a user save attestation or a positive adapter result, separate pause/close approval, and before/after `memory.current` measurement. User attestation is not application verification. A pause does not itself release resident memory; only an observed cgroup delta is reported, and concurrent activity prevents causal attribution. No application adapters are registered, no cgroup files are written, and no processes are signalled, paused, or closed. The simulator never proposes a `memory.max` change. The captured current-cgroup write-open probe does not prove that the target workload is delegated; target write access and ancestor limits remain unvalidated. Real enforcement is blocked until those checks, durable action ownership, expiry recovery, and rollback verification exist.
 
-The OOM guard is an early-warning and coordination layer, not a replacement for the Linux kernel OOM killer. It should intervene before the kernel reaches OOM where telemetry allows, while leaving the kernel as the final safety mechanism.
+The OOM guard is an early-warning and coordination layer, not a replacement for the Linux kernel OOM killer. It should intervene before the kernel reaches OOM where telemetry allows, while leaving the kernel as the final safety mechanism. The Windows backend remains unimplemented; the current CLI reports that the Linux telemetry backend is unavailable on other platforms.
 
 ## 14. cgroup v2 capability discovery
 
 The Linux snapshot reports the controllers visible to the current cgroup, the controllers enabled for its children, whether memory accounting files are present, and whether cgroup.subtree_control can be opened for writing by the current process. The write-open check does not write to the control file and does not change system state.
 
-This is a capability signal, not proof that systemd delegated a complete writable subtree: creating child cgroups, enabling controllers, and managing processes require additional permissions and hierarchy checks. Enforcement must revalidate those permissions at the point of use and must never infer delegation from controller visibility alone. The snapshot schema was bumped to version 2 when capability reporting was added; version 3 added bounded process-correlation diagnostics; version 4 added parent-process relationship fields; version 5 added a bounded parent-linked process sample and explicit truncation/edge metadata; version 6 added executable-path hints; version 7 added a bounded executable inventory; version 8 added CPU/I/O PSI, selected IRQ counters, graphics-driver identity, and thermal zones; version 9 added DRM connector status, enabled state, and mode counts. The separate --diagnose view reads bounded kernel and desktop-session journal excerpts but does not embed journal text into every JSONL sample.
+This is a capability signal, not proof that systemd delegated a complete writable subtree: creating child cgroups, enabling controllers, and managing processes require additional permissions and hierarchy checks. Enforcement must revalidate those permissions at the point of use and must never infer delegation from controller visibility alone. The snapshot schema was bumped to version 2 when capability reporting was added; version 3 added bounded process-correlation diagnostics; version 4 added parent-process relationship fields; version 5 added a bounded parent-linked process sample and explicit truncation/edge metadata; version 6 added executable-path hints; version 7 added a bounded executable inventory; version 8 added CPU/I/O PSI, selected IRQ counters, graphics-driver identity, and thermal zones; version 9 added DRM connector status, enabled state, and mode counts; versions 10–12 added lightweight monitor metadata, OOM/reclaim counters, and overcommit context; version 13 adds per-workload memory.high and memory.max snapshots for dry-run restoration planning; version 14 adds cumulative CPU thermal-throttling counters where sysfs exposes them. The separate --diagnose view reads bounded kernel and desktop-session journal excerpts but does not embed journal text into every JSONL sample.
 
 
 ## 15. Workload hierarchy and memory attribution
@@ -251,3 +251,12 @@ The read-only Linux collector scans numeric `/proc` entries and maps each proces
 `memory.current` remains the authoritative aggregate workload charge, including descendants. Per-process `VmRSS` is an informational estimate only: shared pages can appear in multiple processes' RSS, so process RSS values must never be summed as a replacement for cgroup accounting. Process enumeration is inherently racy; exited, inaccessible, or rapidly moving processes may be missed. The observed count is therefore diagnostic and may differ from `pids.current` (which counts tasks, including threads).
 
 Systemd-escaped unit names are decoded for display and policy matching (for example, `\x2d` becomes `-`). The original cgroup path remains unchanged and is the authoritative workload locator. This matters for protected-workload checks: matching a human-readable unit name against its escaped kernel cgroup spelling can otherwise fail.
+
+
+## 17. Adaptive memory-budget planner — dry-run implementation
+
+The Linux CLI exposes --budget-plan [balanced|gaming|study|development]. It reads the bounded telemetry history (the current 8 MiB JSONL file and one 8 MiB rotation) and keeps at most the latest 1,000 observations per normalized application key in memory. It estimates demand using the nearest-rank P95 after five or more samples, with a conservative 35% bootstrap margin before enough history exists and a 10% margin after learning.
+
+The initial system reserve is 25% of detected physical RAM, clamped between 512 MiB and 2 GiB. Each active app receives a minimum safe floor above current cgroup usage: the greater of 64 MiB or 5% of its current charge. If those floors cannot fit in the app budget, the planner refuses all proposals. Otherwise, it allocates additional headroom in profile-priority order and reports when lower-priority workloads are constrained. Profiles currently use built-in name hints; user-editable categories and priorities are future work.
+
+The output proposes memory.high soft thresholds only, records the previously observed memory.high and memory.max, and never changes either file. Existing finite memory.max values bound the proposed soft threshold; missing or conflicting hard-limit data causes a fail-closed result. This is a planning/simulation layer, not active memory enforcement. The planner does not promise that a workload will stay below its soft threshold, nor does it prevent the kernel from reclaiming cache or swapping anonymous memory.

@@ -14,6 +14,7 @@ pub(crate) struct Snapshot {
     pub(crate) schema_version: u32,
     pub(crate) timestamp_unix_ms: u128,
     pub(crate) platform: &'static str,
+    pub(crate) process_details_collected: bool,
     pub(crate) memory: Memory,
     pub(crate) pressure: Pressure,
     pub(crate) cpu_pressure: Pressure,
@@ -22,6 +23,7 @@ pub(crate) struct Snapshot {
     pub(crate) graphics: Vec<GraphicsDevice>,
     pub(crate) display_connectors: Vec<DisplayConnector>,
     pub(crate) thermal_zones: Vec<ThermalZone>,
+    pub(crate) cpu_thermal_throttle: Option<CpuThermalThrottle>,
     pub(crate) zram: Option<Zram>,
     pub(crate) vmstat: BTreeMap<String, u64>,
     pub(crate) cgroup_v2: Option<CgroupSnapshot>,
@@ -43,6 +45,7 @@ pub(crate) struct Memory {
     pub(crate) swap_used_bytes: Option<u64>,
     pub(crate) committed_bytes: Option<u64>,
     pub(crate) commit_limit_bytes: Option<u64>,
+    pub(crate) overcommit_mode: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -95,6 +98,17 @@ pub(crate) struct ThermalZone {
 }
 
 #[derive(Debug, Serialize)]
+pub(crate) struct CpuThermalThrottle {
+    pub(crate) cpu: String,
+    pub(crate) core_throttle_count: Option<u64>,
+    pub(crate) core_throttle_max_time_ms: Option<u64>,
+    pub(crate) core_throttle_total_time_ms: Option<u64>,
+    pub(crate) package_throttle_count: Option<u64>,
+    pub(crate) package_throttle_max_time_ms: Option<u64>,
+    pub(crate) package_throttle_total_time_ms: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
 pub(crate) struct PsiLine {
     pub(crate) avg10: Option<f64>,
     pub(crate) avg60: Option<f64>,
@@ -141,6 +155,8 @@ pub(crate) struct WorkloadSnapshot {
     pub(crate) name: String,
     pub(crate) path: String,
     pub(crate) memory_current_bytes: Option<u64>,
+    pub(crate) memory_high_limit: Option<String>,
+    pub(crate) memory_max_limit: Option<String>,
     pub(crate) memory_anon_bytes: Option<u64>,
     pub(crate) memory_file_bytes: Option<u64>,
     pub(crate) cpu_usage_usec: Option<u64>,
@@ -180,6 +196,14 @@ impl Snapshot {
         let mut out = String::new();
         out.push_str("Nexus Resource Governor — read-only Linux snapshot\n");
         out.push_str("No resource controls were changed.\n");
+        out.push_str(&format!(
+            "Per-process attribution: {}\n",
+            if self.process_details_collected {
+                "enabled"
+            } else {
+                "skipped (lightweight sample)"
+            }
+        ));
         out.push_str(&format!(
             "cgroup v2: mount={} memory_accounting={} memory_for_children={} subtree_control_write_open={}\n",
             self.cgroup_capabilities.mount_detected,
@@ -222,6 +246,29 @@ impl Snapshot {
         );
         push_metric(&mut out, "Physical RAM free", self.memory.free_bytes);
         push_metric(&mut out, "Swap used", self.memory.swap_used_bytes);
+        push_metric(
+            &mut out,
+            "Committed virtual memory",
+            self.memory.committed_bytes,
+        );
+        push_metric(&mut out, "Commit limit", self.memory.commit_limit_bytes);
+        out.push_str(&format!(
+            "VM overcommit mode: {}\n",
+            self.memory
+                .overcommit_mode
+                .map(|mode| mode.to_string())
+                .unwrap_or_else(|| "unavailable".to_owned())
+        ));
+        for key in [
+            "oom_kill",
+            "compact_stall",
+            "pgscan_direct_throttle",
+            "allocstall",
+        ] {
+            if let Some(value) = self.vmstat.get(key) {
+                out.push_str(&format!("Kernel {key} (since boot): {value}\n"));
+            }
+        }
         if let Some(zram) = &self.zram {
             push_metric(
                 &mut out,
@@ -324,6 +371,23 @@ impl Snapshot {
                 ));
             }
         }
+        if let Some(throttle) = &self.cpu_thermal_throttle {
+            out.push_str("CPU thermal-throttle counters (CPU0 sysfs; cumulative):\n");
+            for (label, value) in [
+                ("core count", throttle.core_throttle_count),
+                ("core max ms", throttle.core_throttle_max_time_ms),
+                ("core total ms", throttle.core_throttle_total_time_ms),
+                ("package count", throttle.package_throttle_count),
+                ("package max ms", throttle.package_throttle_max_time_ms),
+                ("package total ms", throttle.package_throttle_total_time_ms),
+            ] {
+                if let Some(value) = value {
+                    out.push_str(&format!("  {label}: {value}\n"));
+                }
+            }
+        } else {
+            out.push_str("CPU thermal-throttle counters: unavailable\n");
+        }
         if !self.interrupts.is_empty() {
             out.push_str(
                 "Selected interrupt counters (cumulative; IRQ 27 and relevant device handlers):\n",
@@ -362,6 +426,14 @@ impl Snapshot {
                     workload.pids_current.unwrap_or(0),
                     workload.process_count_observed
                 ));
+                let oom = workload.memory_events.get("oom").copied().unwrap_or(0);
+                let oom_kill = workload.memory_events.get("oom_kill").copied().unwrap_or(0);
+                let high = workload.memory_events.get("high").copied().unwrap_or(0);
+                if oom > 0 || oom_kill > 0 || high > 0 {
+                    out.push_str(&format!(
+                        "    cgroup memory events: high={high} oom={oom} oom_kill={oom_kill} (cumulative)\n"
+                    ));
+                }
                 for process in workload.top_processes.iter().take(3) {
                     let rss = process
                         .rss_estimate_bytes
@@ -432,6 +504,44 @@ impl Snapshot {
             out.push_str("  CPU: runnable tasks are experiencing measurable stall pressure.\n");
         } else {
             out.push_str("  CPU: no strong CPU PSI full-stall signal in this sample.\n");
+        }
+        let cpu_temperature = self
+            .thermal_zones
+            .iter()
+            .filter(|zone| {
+                zone.kind.as_deref().is_some_and(|kind| {
+                    kind.eq_ignore_ascii_case("TCPU") || kind.eq_ignore_ascii_case("x86_pkg_temp")
+                })
+            })
+            .filter_map(|zone| zone.temperature_millicelsius)
+            .max();
+        if let Some(temperature) = cpu_temperature {
+            if temperature >= 90_000 {
+                out.push_str(&format!(
+                    "  THERMAL WARNING: CPU/package sensor is currently {:.1} °C; correlate with thermal-throttle counter deltas.\n",
+                    temperature as f64 / 1000.0
+                ));
+            }
+        }
+        if let Some(throttle) = &self.cpu_thermal_throttle {
+            let core_ms = throttle.core_throttle_total_time_ms.unwrap_or(0);
+            let package_ms = throttle.package_throttle_total_time_ms.unwrap_or(0);
+            if core_ms > 0 || package_ms > 0 {
+                out.push_str(&format!(
+                    "  THERMAL: cumulative CPU0 throttling is core={} ms, package={} ms since boot; use monitor deltas to identify active throttling.\n",
+                    core_ms, package_ms
+                ));
+            }
+        }
+        let unavailable_thermal_sensors = self
+            .thermal_zones
+            .iter()
+            .filter(|zone| zone.temperature_millicelsius.is_none())
+            .count();
+        if unavailable_thermal_sensors > 0 {
+            out.push_str(&format!(
+                "  THERMAL: {unavailable_thermal_sensors} thermal-zone sensor(s) returned no temperature; inspect ACPI/firmware logs before trusting missing readings.\n"
+            ));
         }
         if io_full.is_some_and(|v| v >= 0.5) {
             out.push_str("  STORAGE: I/O PSI indicates tasks stalled on I/O; inspect device latency and kernel logs.\n");
@@ -571,6 +681,14 @@ fn push_metric(out: &mut String, label: &str, value: Option<u64>) {
 }
 
 pub fn collect_snapshot() -> io::Result<Snapshot> {
+    collect_snapshot_with_process_details(true)
+}
+
+pub fn collect_monitor_snapshot() -> io::Result<Snapshot> {
+    collect_snapshot_with_process_details(false)
+}
+
+fn collect_snapshot_with_process_details(include_process_details: bool) -> io::Result<Snapshot> {
     let mem = parse_meminfo(&fs::read_to_string(MEMINFO)?);
     let swap_total = mem.get("SwapTotal").copied();
     let swap_free = mem.get("SwapFree").copied();
@@ -591,6 +709,9 @@ pub fn collect_snapshot() -> io::Result<Snapshot> {
         },
         committed_bytes: kib_to_bytes(mem.get("Committed_AS").copied()),
         commit_limit_bytes: kib_to_bytes(mem.get("CommitLimit").copied()),
+        overcommit_mode: fs::read_to_string("/proc/sys/vm/overcommit_memory")
+            .ok()
+            .and_then(|value| value.trim().parse().ok()),
     };
 
     let pressure = read_pressure("/proc/pressure/memory");
@@ -603,9 +724,10 @@ pub fn collect_snapshot() -> io::Result<Snapshot> {
         .as_millis();
 
     Ok(Snapshot {
-        schema_version: 9,
+        schema_version: 14,
         timestamp_unix_ms,
         platform: "linux",
+        process_details_collected: include_process_details,
         memory,
         pressure,
         cpu_pressure,
@@ -614,11 +736,12 @@ pub fn collect_snapshot() -> io::Result<Snapshot> {
         graphics: read_graphics_devices(),
         display_connectors: read_display_connectors(),
         thermal_zones: read_thermal_zones(),
+        cpu_thermal_throttle: read_cpu_thermal_throttle(),
         zram: read_zram("zram0").ok().flatten(),
         vmstat: read_vmstat()?,
         cgroup_v2: read_current_cgroup().ok().flatten(),
         cgroup_capabilities: read_cgroup_capabilities(),
-        workloads: read_workloads().unwrap_or_default(),
+        workloads: read_workloads(include_process_details).unwrap_or_default(),
     })
 }
 
@@ -674,7 +797,7 @@ fn is_relevant_kernel_event(line: &str) -> bool {
 }
 
 fn journal_message_signature(line: &str) -> &str {
-    line.rsplit_once("]: ")
+    line.rsplit_once(": ")
         .map(|(_, message)| message)
         .unwrap_or(line)
 }
@@ -1128,6 +1251,41 @@ fn read_thermal_zones() -> Vec<ThermalZone> {
     zones
 }
 
+fn parse_thermal_throttle_counter(input: &str) -> Option<u64> {
+    input.trim().parse::<u64>().ok()
+}
+
+fn read_cpu_thermal_throttle() -> Option<CpuThermalThrottle> {
+    // CPU0 provides one representative counter set. Do not sum package
+    // counters across CPUs because package-level values may be duplicated.
+    let base = Path::new("/sys/devices/system/cpu/cpu0/thermal_throttle");
+    let read = |name: &str| {
+        fs::read_to_string(base.join(name))
+            .ok()
+            .and_then(|value| parse_thermal_throttle_counter(&value))
+    };
+    let throttle = CpuThermalThrottle {
+        cpu: "cpu0".to_owned(),
+        core_throttle_count: read("core_throttle_count"),
+        core_throttle_max_time_ms: read("core_throttle_max_time_ms"),
+        core_throttle_total_time_ms: read("core_throttle_total_time_ms"),
+        package_throttle_count: read("package_throttle_count"),
+        package_throttle_max_time_ms: read("package_throttle_max_time_ms"),
+        package_throttle_total_time_ms: read("package_throttle_total_time_ms"),
+    };
+    [
+        throttle.core_throttle_count,
+        throttle.core_throttle_max_time_ms,
+        throttle.core_throttle_total_time_ms,
+        throttle.package_throttle_count,
+        throttle.package_throttle_max_time_ms,
+        throttle.package_throttle_total_time_ms,
+    ]
+    .iter()
+    .any(Option::is_some)
+    .then_some(throttle)
+}
+
 fn read_psi_line(path: &str, wanted: &str) -> io::Result<Option<PsiLine>> {
     let contents = fs::read_to_string(path)?;
     for line in contents.lines() {
@@ -1183,29 +1341,39 @@ fn read_zram(device: &str) -> io::Result<Option<Zram>> {
     }))
 }
 
-fn read_vmstat() -> io::Result<BTreeMap<String, u64>> {
+fn parse_vmstat(input: &str) -> BTreeMap<String, u64> {
     const SELECTED: &[&str] = &[
         "pgmajfault",
+        "oom_kill",
+        "compact_stall",
+        "pgscan_direct_throttle",
         "pswpin",
         "pswpout",
-        "allocstall",
         "pgscan_kswapd",
         "pgscan_direct",
         "pgsteal_kswapd",
         "pgsteal_direct",
     ];
-    let contents = fs::read_to_string("/proc/vmstat")?;
-    Ok(contents
-        .lines()
-        .filter_map(|line| {
-            let mut parts = line.split_whitespace();
-            let key = parts.next()?;
-            if !SELECTED.contains(&key) {
-                return None;
-            }
-            Some((key.to_owned(), parts.next()?.parse().ok()?))
-        })
-        .collect())
+    let mut counters = BTreeMap::new();
+    let mut allocstall_total = 0u64;
+    for line in input.lines() {
+        let mut parts = line.split_whitespace();
+        let Some(key) = parts.next() else { continue };
+        let Some(value) = parts.next().and_then(|value| value.parse::<u64>().ok()) else {
+            continue;
+        };
+        if SELECTED.contains(&key) {
+            counters.insert(key.to_owned(), value);
+        } else if key.starts_with("allocstall_") {
+            allocstall_total = allocstall_total.saturating_add(value);
+        }
+    }
+    counters.insert("allocstall".to_owned(), allocstall_total);
+    counters
+}
+
+fn read_vmstat() -> io::Result<BTreeMap<String, u64>> {
+    Ok(parse_vmstat(&fs::read_to_string("/proc/vmstat")?))
 }
 
 fn current_cgroup_relative_path() -> io::Result<Option<PathBuf>> {
@@ -1327,7 +1495,7 @@ fn decode_systemd_escape(input: &str) -> String {
     String::from_utf8_lossy(&decoded).into_owned()
 }
 
-fn read_workloads() -> io::Result<Vec<WorkloadSnapshot>> {
+fn read_workloads(include_process_details: bool) -> io::Result<Vec<WorkloadSnapshot>> {
     let Some(current_path) = current_cgroup_relative_path()? else {
         return Ok(Vec::new());
     };
@@ -1371,6 +1539,8 @@ fn read_workloads() -> io::Result<Vec<WorkloadSnapshot>> {
                 name,
                 path: path.to_string_lossy().into_owned(),
                 memory_current_bytes: read_u64(path.join("memory.current")).ok(),
+                memory_high_limit: read_limit(path.join("memory.high")).ok(),
+                memory_max_limit: read_limit(path.join("memory.max")).ok(),
                 memory_anon_bytes: memory_stat.get("anon").copied(),
                 memory_file_bytes: memory_stat.get("file").copied(),
                 cpu_usage_usec: cpu_stat.get("usage_usec").copied(),
@@ -1387,7 +1557,9 @@ fn read_workloads() -> io::Result<Vec<WorkloadSnapshot>> {
         }
     }
 
-    correlate_processes(&mut workloads);
+    if include_process_details {
+        correlate_processes(&mut workloads);
+    }
     workloads.sort_by_key(|item| std::cmp::Reverse(item.memory_current_bytes.unwrap_or(0)));
     Ok(workloads)
 }
@@ -1923,6 +2095,8 @@ mod tests {
             name: "app-demo.scope".to_owned(),
             path: "/sys/fs/cgroup/user.slice/user-1000.slice/app.slice/app-demo.scope".to_owned(),
             memory_current_bytes: Some(4096),
+            memory_high_limit: Some("max".to_owned()),
+            memory_max_limit: Some("max".to_owned()),
             memory_anon_bytes: None,
             memory_file_bytes: None,
             cpu_usage_usec: None,
@@ -1951,6 +2125,17 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn vmstat_aggregates_allocstall_zones_and_keeps_oom_counters() {
+        let parsed = parse_vmstat(
+            "oom_kill 2\nallocstall_dma 1\nallocstall_dma32 2\nallocstall_normal 4\npgscan_direct 9\nnot_selected 100\n",
+        );
+        assert_eq!(parsed.get("oom_kill"), Some(&2));
+        assert_eq!(parsed.get("allocstall"), Some(&7));
+        assert_eq!(parsed.get("pgscan_direct"), Some(&9));
+        assert!(!parsed.contains_key("not_selected"));
     }
 
     #[test]
@@ -2118,6 +2303,13 @@ mod tests {
     }
 
     #[test]
+    fn kernel_event_filter_deduplicates_repeated_acpi_sensor_errors() {
+        let input = "2026-11-16T14:42:38 archlinux kernel: ACPI BIOS Error (bug): Could not resolve symbol [\\_SB.PC00.LPCB.HEC.TSR5], AE_NOT_FOUND\n2026-11-16T14:42:40 archlinux kernel: ACPI BIOS Error (bug): Could not resolve symbol [\\_SB.PC00.LPCB.HEC.TSR5], AE_NOT_FOUND\n";
+        let parsed = parse_kernel_events(input, 8);
+        assert_eq!(parsed.len(), 1);
+    }
+
+    #[test]
     fn kernel_event_filter_returns_empty_for_unrelated_logs() {
         assert!(parse_kernel_events("systemd started user manager\n", 40).is_empty());
     }
@@ -2138,6 +2330,13 @@ mod tests {
     fn interrupt_parser_respects_entry_limit() {
         let input = "27: 1 2 idma64\n28: 3 4 i2c_dw\n29: 5 6 nvme\n";
         assert_eq!(parse_interrupts(input, 2).len(), 2);
+    }
+
+    #[test]
+    fn parses_thermal_throttle_counters_without_accepting_invalid_values() {
+        assert_eq!(parse_thermal_throttle_counter("176853\n"), Some(176_853));
+        assert_eq!(parse_thermal_throttle_counter("unknown"), None);
+        assert_eq!(parse_thermal_throttle_counter("-1"), None);
     }
 
     #[test]
