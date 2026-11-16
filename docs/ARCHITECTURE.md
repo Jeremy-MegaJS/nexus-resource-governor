@@ -260,3 +260,13 @@ The Linux CLI exposes --budget-plan [balanced|gaming|study|development]. It read
 The initial system reserve is 25% of detected physical RAM, clamped between 512 MiB and 2 GiB. Each active app receives a minimum safe floor above current cgroup usage: the greater of 64 MiB or 5% of its current charge. If those floors cannot fit in the app budget, the planner refuses all proposals. Otherwise, it allocates additional headroom in profile-priority order and reports when lower-priority workloads are constrained. Profiles currently use built-in name hints; user-editable categories and priorities are future work.
 
 The output proposes memory.high soft thresholds only, records the previously observed memory.high and memory.max, and never changes either file. Existing finite memory.max values bound the proposed soft threshold; missing or conflicting hard-limit data causes a fail-closed result. This is a planning/simulation layer, not active memory enforcement. The planner does not promise that a workload will stay below its soft threshold, nor does it prevent the kernel from reclaiming cache or swapping anonymous memory.
+
+## 18. NRG Desktop — initial read-only user interface
+
+The optional PySide6 application in desktop/nrg_desktop.py is a separate user-session interface; it does not replace or supervise the low-overhead systemd user monitor. It samples /proc every five seconds while open and presents process CPU deltas, RSS estimates, disk read/write rates, process owner, and executable path. It never reads /proc/PID/cmdline or /proc/PID/environ.
+
+Initial anomaly heuristics are deliberately narrow and explainable: sustained CPU use (>=80% of one logical core for three samples), repeated RSS growth (>=128 MiB per sample for two samples), sustained writes (>=100 MiB/s for three samples), deleted executables, and executables launched from temporary directories. These signals prioritize manual review; they are not a malware classifier and can produce false positives for builds, games, browsers, renderers, and other legitimate workloads.
+
+System-wide state uses MemAvailable, swap use, CPU utilization, home-volume free space, and memory/CPU/I/O PSI. The existing --diagnose report is exposed in the GUI for kernel, DRM, display, IRQ, ACPI, and thermal investigation. The existing budget planner is exposed as a profile selector and dry-run table. The selected profile is persisted in ~/.config/nrg/desktop.json with user-only permissions.
+
+The desktop entry is installed under ~/.local/share/applications by packaging/install-desktop.sh. The application runs as the logged-in user, requires PySide6, and makes no cgroup, scheduler, kernel, process-control, or privilege changes. The background monitor continues when the UI closes.

@@ -69,11 +69,16 @@ The project currently has a read-only Linux telemetry backend and a policy/Rescu
 **Exit criteria:** every intervention is bounded, observable, reversible, and tested against failure cases.
 
 ## Phase 4 — Desktop experience
-- [ ] System tray and live resource overview.
+- [x] Build initial PySide6 NRG Desktop for live read-only resource/process diagnostics, heuristic anomaly review, and adaptive budget-plan inspection.
+- [x] Live resource overview with RAM, swap, CPU, PSI, and home-volume free space.
+- [ ] System tray integration.
 - [ ] Per-application budgets and profiles.
 - [ ] Clear explanations and confirmation prompts.
 - [ ] Temporary overrides and one-click restoration.
 - [ ] Accessibility, localization, and startup behavior.
+
+- [ ] Add editable per-profile application priorities and workload aliases; persist user-defined coaster profiles and make the planner consume them.
+- [ ] Expand process anomaly context with package ownership, parent/child lineage, network activity rates, and persistence indicators without collecting command-line arguments or secrets.
 
 ## Phase 5 — Windows backend
 - [ ] Implement Windows telemetry provider.

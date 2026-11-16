@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=NRG Desktop
+GenericName=Resource Governor
+Comment=Monitor resources and diagnose system slowdowns
+Exec=@NRG_DESKTOP_SCRIPT@
+TryExec=/usr/bin/python3
+Path=@NRG_PROJECT_ROOT@
+Icon=utilities-system-monitor
+Terminal=false
+Categories=System;Monitor;
+StartupNotify=true
