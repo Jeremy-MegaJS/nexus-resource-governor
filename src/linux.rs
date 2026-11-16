@@ -667,21 +667,13 @@ impl Snapshot {
                 )),
             }
         }
-        if irq27_disabled || irq27_unhandled {
-            out.push_str(
-                "\nIRQ 27 WARNING: retained kernel logs show an unhandled interrupt storm and/or the kernel disabling IRQ 27. The associated handler is i2c_designware/idma64; this is historical evidence, not proof the IRQ is currently failing.\n",
-            );
-        }
-        if acpi_sensor_lookup_errors {
-            out.push_str(
-                "ACPI SENSOR WARNING: firmware repeatedly references the missing SEN5/TSR5 sensor object; thermal_zone6 has no reading. This makes that sensor unavailable and does not by itself prove a CPU thermal fault.\n",
-            );
-        }
-        if gpu_hang_or_reset {
-            out.push_str(
-                "GPU WARNING: retained kernel logs include a GPU hang/reset marker; correlate its timestamp with DRM connector and KWin presentation failures.\n",
-            );
-        }
+        append_kernel_diagnostic_warnings(
+            &mut out,
+            irq27_disabled,
+            irq27_unhandled,
+            acpi_sensor_lookup_errors,
+            gpu_hang_or_reset,
+        );
         if desktop_reported_no_outputs {
             out.push_str("\nDISPLAY WARNING: the desktop journal reported that no display outputs were available. Correlate this with DRM connector status and the event timestamp.\n");
         }
@@ -693,6 +685,30 @@ impl Snapshot {
         }
         out.push_str("\nCORRELATION: capture JSONL during the next freeze and record its local timestamp; a single snapshot cannot identify the cause.\n");
         out
+    }
+}
+
+fn append_kernel_diagnostic_warnings(
+    out: &mut String,
+    irq27_disabled: bool,
+    irq27_unhandled: bool,
+    acpi_sensor_lookup_errors: bool,
+    gpu_hang_or_reset: bool,
+) {
+    if irq27_disabled || irq27_unhandled {
+        out.push_str(
+            "\nIRQ 27 WARNING: retained kernel logs show an unhandled interrupt and/or the kernel disabling IRQ 27. IRQ numbers do not identify a handler; verify /proc/interrupts for the same boot. This is historical evidence only. NRG never changes IRQ or driver state.\n",
+        );
+    }
+    if acpi_sensor_lookup_errors {
+        out.push_str(
+            "ACPI SENSOR WARNING: retained kernel logs reference an unresolved ACPI sensor object. Correlate with the current thermal-zone inventory; this does not by itself prove a CPU thermal fault.\n",
+        );
+    }
+    if gpu_hang_or_reset {
+        out.push_str(
+            "GPU WARNING: retained kernel logs include a GPU hang/reset marker; correlate its timestamp with DRM connector and KWin presentation failures.\n",
+        );
     }
 }
 
@@ -2327,6 +2343,17 @@ mod tests {
         assert_eq!(parsed.len(), 2);
         assert!(parsed[0].contains("i915 GPU HANG"));
         assert!(parsed[1].contains("ACPI BIOS Error"));
+    }
+
+    #[test]
+    fn kernel_diagnostic_warnings_do_not_assume_irq_handlers_or_thermal_zone_numbers() {
+        let mut output = String::new();
+        append_kernel_diagnostic_warnings(&mut output, true, true, true, false);
+        assert!(output.contains("verify /proc/interrupts for the same boot"));
+        assert!(output.contains("NRG never changes IRQ or driver state"));
+        assert!(!output.contains("i2c_designware"));
+        assert!(!output.contains("idma64"));
+        assert!(!output.contains("thermal_zone6"));
     }
 
     #[test]
