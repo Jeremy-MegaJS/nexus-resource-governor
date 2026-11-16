@@ -21,6 +21,16 @@ struct HistoryWorkload {
     memory_current_bytes: Option<u64>,
 }
 
+#[derive(Debug, Deserialize)]
+struct UserProfileFile {
+    profiles: BTreeMap<String, UserProfile>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UserProfile {
+    priorities: Vec<String>,
+}
+
 #[derive(Debug, Serialize)]
 pub(crate) struct BudgetPlan {
     pub(crate) schema_version: u32,
@@ -76,6 +86,7 @@ fn build_plan_with_history(
     history_samples_loaded: usize,
 ) -> BudgetPlan {
     let profile = normalize_profile(requested_profile);
+    let custom_priorities = load_custom_priorities(&profile);
     let total = snapshot.memory.total_bytes;
     let reserve = total.map(|bytes| (bytes / 4).clamp(512 * MIB, 2 * 1024 * MIB));
     let allocatable = total
@@ -104,7 +115,7 @@ fn build_plan_with_history(
         // immediately force reclaim just because the plan was calculated.
         let floor = current.saturating_add((current / 20).max(64 * MIB));
         let desired = estimated.max(floor);
-        let (rank, priority) = priority_for(&profile, &key);
+        let (rank, priority) = priority_for(&profile, &key, custom_priorities.as_deref());
         let (hard_max_bytes, hard_max_unlimited) = match workload.memory_max_limit.as_deref() {
             Some("max") => (None, true),
             Some(value) => (value.parse::<u64>().ok(), false),
@@ -210,15 +221,65 @@ fn build_plan_with_history(
 }
 
 fn normalize_profile(profile: &str) -> String {
-    match profile.trim().to_ascii_lowercase().as_str() {
+    let normalized = profile.trim().to_ascii_lowercase();
+    match normalized.as_str() {
         "gaming" | "game" => "gaming".to_owned(),
         "study" | "school" | "work" => "study".to_owned(),
         "development" | "dev" | "coding" => "development".to_owned(),
+        "balanced" => "balanced".to_owned(),
+        _ if !normalized.is_empty()
+            && normalized.len() <= 32
+            && normalized
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') =>
+        {
+            normalized
+        }
         _ => "balanced".to_owned(),
     }
 }
 
-fn priority_for(profile: &str, key: &str) -> (u8, &'static str) {
+fn load_custom_priorities(profile: &str) -> Option<Vec<String>> {
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))?;
+    let path = base.join("nrg").join("profiles.json");
+    let raw = fs::read_to_string(path).ok()?;
+    let config: UserProfileFile = serde_json::from_str(&raw).ok()?;
+    let entry = config
+        .profiles
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(profile))
+        .map(|(_, entry)| entry)?;
+    if entry.priorities.len() > 64 {
+        return None;
+    }
+    let values: Vec<String> = entry
+        .priorities
+        .iter()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| {
+            !value.is_empty()
+                && value.len() <= 80
+                && value
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
+        })
+        .take(64)
+        .collect();
+    Some(values)
+}
+
+fn priority_for(profile: &str, key: &str, custom: Option<&[String]>) -> (u8, &'static str) {
+    if let Some(patterns) = custom {
+        if let Some(index) = patterns.iter().position(|pattern| key.contains(pattern)) {
+            return (
+                index.saturating_add(1).min(u8::MAX as usize) as u8,
+                "CUSTOM",
+            );
+        }
+        return (100, "NORMAL");
+    }
     let patterns: &[&str] = match profile {
         "gaming" => &["geforcenow", "geometry", "steam", "gamescope", "bottles"],
         "study" => &[
@@ -385,10 +446,23 @@ mod tests {
     #[test]
     fn profile_priorities_change_by_context() {
         assert!(
-            priority_for("gaming", "com.nvidia.geforcenow").0
-                < priority_for("study", "com.nvidia.geforcenow").0
+            priority_for("gaming", "com.nvidia.geforcenow", None).0
+                < priority_for("study", "com.nvidia.geforcenow", None).0
         );
-        assert!(priority_for("study", "chatgpt").0 < priority_for("gaming", "chatgpt").0);
+        assert!(
+            priority_for("study", "chatgpt", None).0 < priority_for("gaming", "chatgpt", None).0
+        );
+    }
+
+    #[test]
+    fn custom_profile_priorities_override_builtin_order() {
+        let custom = vec!["browser".to_owned(), "geforcenow".to_owned()];
+        assert_eq!(
+            priority_for("custom", "com.nvidia.geforcenow", Some(&custom)).0,
+            2
+        );
+        assert_eq!(priority_for("custom", "org.browser", Some(&custom)).0, 1);
+        assert_eq!(priority_for("custom", "chatgpt", Some(&custom)).0, 100);
     }
 
     #[test]

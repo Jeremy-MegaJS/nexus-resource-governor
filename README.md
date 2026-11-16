@@ -143,13 +143,15 @@ cargo run --release -- --watch-full 5000 >> nrg-session-full.jsonl
 
 ## NRG Desktop (early GUI)
 
-A lightweight PySide6 desktop interface is available for KDE/Linux. It provides a live resource overview (RAM, swap, CPU, PSI, and home-volume free space), a read-only process inventory, heuristic anomaly indicators, the adaptive memory-budget planner, and the kernel/graphics/IRQ/thermal diagnostic report.
+A lightweight bilingual (English/Spanish) PySide6 desktop interface is available for KDE/Linux. It provides a live resource overview (RAM, swap, CPU, PSI, home-volume free space, exposed dedicated GPU memory, and aggregate network throughput), a read-only process inventory, heuristic anomaly indicators, the adaptive memory-budget planner, and the kernel/graphics/IRQ/thermal diagnostic report.
 
 Build the agent with cargo build --release, then install the launcher with ./packaging/install-desktop.sh. Open NRG Desktop from the application menu. The UI refreshes process metrics every five seconds and can be closed independently of the nrg-monitor.service background monitor.
 
-The process view reads /proc metadata (PID, executable path, owner, RSS, CPU counters, and I/O counters). It does not read process command-line arguments or environment variables. Indicators include sustained high CPU, rapid RSS growth, sustained disk writes, deleted executables, and executables launched from temporary directories. These are investigation clues, not malware detection or a virus verdict. RSS is an estimate and must not be summed as unique physical memory.
+The process view reads /proc metadata (PID, executable path, owner, RSS, CPU counters, and I/O counters). It does not read process command-line arguments or environment variables. Indicators include sustained high CPU, rapid RSS growth, sustained disk writes, deleted executables, executables launched from temporary directories, unusually rapid process-count growth, and parent processes creating unusually large bursts of direct children. These are investigation clues, not malware detection or a virus verdict. RSS is an estimate and must not be summed as unique physical memory.
 
-The GUI requires the system Python PySide6 package. It runs as the logged-in user and does not require root. The desktop app is read-only: it does not kill, pause, renice, sandbox, or apply cgroup limits to processes. Profile selection is saved to ~/.config/nrg/desktop.json; the selected profile only changes the dry-run planner output.
+The GUI requires the system Python PySide6 package. It runs as the logged-in user and does not require root. The desktop app is read-only: it does not kill, pause, renice, sandbox, shape network traffic, or apply cgroup limits to processes. Profile selection and UI language are saved to ~/.config/nrg/desktop.json. Use Edit coasters to manage ~/.config/nrg/profiles.json, with profile priorities ordered from highest to lowest. The Rust planner reads those priorities when generating dry-run memory proposals; no resource controls are applied.
+
+The GPU panel reports dedicated VRAM only when NVIDIA or DRM exposes reliable counters. Integrated graphics are labelled as shared with system RAM rather than being assigned a fictitious VRAM total. Network throughput is aggregate per active physical interface, not per application. The network budget preview accepts the contracted download/upload plan rates and simulates a share for the profile's top-priority workload after a 10% safety margin; it does not configure tc, eBPF, nftables, or change the Wi-Fi connection. Rapid process creation is an investigation signal, not a fork-bomb or malware verdict.
 
 ## Development
 

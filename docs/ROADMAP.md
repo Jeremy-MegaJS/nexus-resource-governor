@@ -75,10 +75,16 @@ The project currently has a read-only Linux telemetry backend and a policy/Rescu
 - [ ] Per-application budgets and profiles.
 - [ ] Clear explanations and confirmation prompts.
 - [ ] Temporary overrides and one-click restoration.
-- [ ] Accessibility, localization, and startup behavior.
-
-- [ ] Add editable per-profile application priorities and workload aliases; persist user-defined coaster profiles and make the planner consume them.
-- [ ] Expand process anomaly context with package ownership, parent/child lineage, network activity rates, and persistence indicators without collecting command-line arguments or secrets.
+- [x] Add English/Spanish UI language selection.
+- [x] Add editable named coaster profiles with ordered application-name priority fragments; Rust planner consumes the saved priorities.
+- [x] Add exposed dedicated-GPU-memory telemetry and aggregate physical-interface network throughput.
+- [x] Add a contracted-bandwidth network budget preview (simulation only; no traffic shaping).
+- [x] Add rapid process-count and per-parent child-burst review signals (heuristics only).
+- [ ] Add system tray integration.
+- [ ] Add persistent workload identity and editable per-app memory floors/ceilings.
+- [ ] Add package ownership, complete process-tree growth correlation, per-cgroup network counters, per-process GPU attribution, connection/persistence context, without collecting command-line arguments or secrets.
+- [ ] Implement safe, capability-checked cgroup memory.high enforcement with explicit approval, expiry, audit, and rollback.
+- [ ] Implement per-workload network shaping using a validated cgroup-v2/eBPF or equivalent backend, with explicit approval and rollback.
 
 ## Phase 5 — Windows backend
 - [ ] Implement Windows telemetry provider.
