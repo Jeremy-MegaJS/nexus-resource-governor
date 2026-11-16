@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """NRG Desktop: resource monitoring, guarded process management, and diagnostics."""
 from __future__ import annotations
-import configparser, json, os, pwd, re, signal, shlex, shutil, subprocess, sys, time, urllib.request
+import configparser, json, os, pwd, re, signal, shutil, subprocess, sys, time, urllib.request, platform, socket
 from pathlib import Path
 from PySide6.QtCore import Qt, QProcess, QTimer, QThread, Signal, QPointF
-from PySide6.QtGui import QFont, QColor, QPainter, QPen, QPolygonF, QIcon, QIcon
+from PySide6.QtGui import QFont, QColor, QPainter, QPen, QPolygonF, QIcon
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QGridLayout,
     QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMenu, QMessageBox, QPushButton,
@@ -19,52 +19,255 @@ REFRESH_MS, MAX_ROWS = 5000, 120
 PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
 CLK_TCK = os.sysconf("SC_CLK_TCK")
 CPU_COUNT = os.cpu_count() or 1
-_KDE_SENSOR_IDS = None
-
-
-def read_ksystemstats():
-    """Read KDE's own hardware sensor service when available; all sensors remain optional."""
-    global _KDE_SENSOR_IDS
-    if _KDE_SENSOR_IDS is None:
+def read_hwmon_sensors():
+    """Read kernel hwmon values directly; no KSystemStats/D-Bus dependency."""
+    sensors = {"temperatures": [], "fans": [], "voltages": [], "power": []}
+    for device in Path("/sys/class/hwmon").glob("hwmon*"):
         try:
-            listed = subprocess.run(["kstatsviewer", "--list"], capture_output=True,
-                                    text=True, timeout=2.0, check=False)
-            ids = []
-            for line in listed.stdout.splitlines():
-                sensor = line.split(maxsplit=1)[0] if line.split() else ""
-                if (sensor in ("cpu/all/averageTemperature", "cpu/all/maximumTemperature")
-                    or sensor.startswith(("gpu/", "power/", "network/", "disk/", "lmsensors/"))
-                    and sensor.rsplit("/", 1)[-1] in (
-                        "usage", "temperature", "usedVram", "totalVram", "usedPercent",
-                        "charge", "health", "signal", "download", "upload", "read", "write",
-                        "fan1", "fan2", "temp1", "temp2", "temp3")):
-                    ids.append(sensor)
-            _KDE_SENSOR_IDS = list(dict.fromkeys(ids))[:48]
-        except (OSError, subprocess.TimeoutExpired):
-            _KDE_SENSOR_IDS = []
-    if not _KDE_SENSOR_IDS:
-        return {}
+            chip = (device / "name").read_text().strip()
+        except OSError:
+            continue
+        for label_path in device.glob("*_label"):
+            stem = label_path.name[:-6]
+            try:
+                label = label_path.read_text().strip()
+                raw = float((device / f"{stem}_input").read_text().strip())
+            except (OSError, ValueError):
+                continue
+            if stem.startswith("temp"):
+                if raw > 0:
+                    sensors["temperatures"].append({"chip": chip, "label": label, "celsius": raw / 1000})
+            elif stem.startswith("fan"):
+                if raw > 0:
+                    sensors["fans"].append({"chip": chip, "label": label, "rpm": raw})
+            elif stem.startswith("in"):
+                sensors["voltages"].append({"chip": chip, "label": label, "volts": raw / 1000})
+            elif stem.startswith("power"):
+                sensors["power"].append({"chip": chip, "label": label, "watts": raw / 1_000_000})
+        # Some drivers omit labels; expose only meaningful positive fan readings.
+        for input_path in device.glob("fan*_input"):
+            try:
+                rpm = float(input_path.read_text().strip())
+            except (OSError, ValueError):
+                continue
+            if rpm > 0 and not any(x["chip"] == chip and x["rpm"] == rpm for x in sensors["fans"]):
+                sensors["fans"].append({"chip": chip, "label": input_path.stem, "rpm": rpm})
+    return sensors
+
+
+def read_cpu_cores():
+    """Per-logical-CPU utilization counters from /proc/stat."""
+    cores = {}
     try:
-        command = ["busctl", "--user", "call", "org.kde.ksystemstats1",
-                   "/org/kde/ksystemstats1", "org.kde.ksystemstats1", "sensorData",
-                   "as", str(len(_KDE_SENSOR_IDS)), *_KDE_SENSOR_IDS]
-        result = subprocess.run(command, capture_output=True, text=True, timeout=1.2, check=False)
-        if result.returncode:
-            return {}
-        tokens = shlex.split(result.stdout)
-        values = {}
-        if len(tokens) < 2:
-            return values
-        index = 2
-        while index + 2 < len(tokens):
-            name, kind, raw = tokens[index:index+3]
-            index += 3
-            if kind in ("i", "u", "x", "t", "d", "n", "q"):
-                try: values[name] = float(raw)
-                except ValueError: pass
-        return values
-    except (OSError, subprocess.TimeoutExpired, ValueError):
+        for line in Path("/proc/stat").read_text().splitlines():
+            fields = line.split()
+            if not fields or not re.fullmatch(r"cpu\d+", fields[0]):
+                continue
+            values = [int(value) for value in fields[1:]]
+            idle = values[3] + (values[4] if len(values) > 4 else 0)
+            cores[fields[0]] = (sum(values[:8]), idle)
+    except (OSError, ValueError):
         return {}
+    return cores
+
+
+def cpu_core_percentages(current, previous):
+    result = {}
+    for name, (total, idle) in current.items():
+        old = previous.get(name)
+        if old is None:
+            result[name] = None
+            continue
+        delta_total = max(0, total - old[0])
+        delta_idle = max(0, idle - old[1])
+        result[name] = max(0.0, min(100.0, 100 * (delta_total - delta_idle) / delta_total)) if delta_total else 0.0
+    return result
+
+
+def read_network_interfaces():
+    """Per-interface byte/packet/error counters and IP addresses, using kernel interfaces."""
+    addresses = {}
+    try:
+        result = subprocess.run(["ip", "-j", "address", "show"], capture_output=True,
+                                text=True, timeout=0.7, check=False)
+        if result.returncode == 0:
+            for item in json.loads(result.stdout):
+                addresses[item.get("ifname", "")] = {
+                    "ipv4": [a.get("local", "") for a in item.get("addr_info", []) if a.get("family") == "inet"],
+                    "ipv6": [a.get("local", "") for a in item.get("addr_info", []) if a.get("family") == "inet6"],
+                }
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        pass
+    result = {}
+    for interface in Path("/sys/class/net").iterdir():
+        name = interface.name
+        if name == "lo" or name.startswith(("veth", "docker", "br-", "virbr", "tun", "tap")):
+            continue
+        try:
+            stats = interface / "statistics"
+            operstate = (interface / "operstate").read_text().strip()
+            result[name] = {
+                "state": operstate,
+                "kind": "Wi-Fi" if (interface / "wireless").exists() else "Ethernet" if name.startswith(("en", "eth")) else "Network",
+                "rx": int((stats / "rx_bytes").read_text()),
+                "tx": int((stats / "tx_bytes").read_text()),
+                "rx_packets": int((stats / "rx_packets").read_text()),
+                "tx_packets": int((stats / "tx_packets").read_text()),
+                "rx_errors": int((stats / "rx_errors").read_text()),
+                "tx_errors": int((stats / "tx_errors").read_text()),
+                "addresses": addresses.get(name, {"ipv4": [], "ipv6": []}),
+            }
+        except (OSError, ValueError):
+            continue
+    return result
+
+
+def read_wireless_signal():
+    try:
+        for line in Path("/proc/net/wireless").read_text().splitlines()[2:]:
+            fields = line.replace(":", " ").split()
+            if len(fields) >= 4:
+                quality, level = float(fields[2]), float(fields[3])
+                return f"{quality:.0f}/70 · {level:.0f} dBm"
+    except (OSError, ValueError, IndexError):
+        pass
+    return "—"
+
+
+def read_block_devices():
+    """Physical block-device identity, capacity, and live I/O counters."""
+    devices = {}
+    for device in Path("/sys/block").iterdir():
+        name = device.name
+        if name.startswith(("loop", "ram", "zram", "dm-", "md")):
+            continue
+        try:
+            sectors = int((device / "size").read_text())
+            stat = [int(x) for x in (device / "stat").read_text().split()]
+            model = ""
+            for candidate in (device / "device/model", device / "device/name"):
+                try:
+                    model = candidate.read_text().strip()
+                    if model: break
+                except OSError:
+                    pass
+            devices[name] = {
+                "model": model or name, "bytes": sectors * 512,
+                "read_sectors": stat[2], "read_ms": stat[3],
+                "write_sectors": stat[6], "write_ms": stat[7],
+                "busy_ms": stat[9] if len(stat) > 9 else 0,
+            }
+        except (OSError, ValueError, IndexError):
+            continue
+    return devices
+
+
+def read_gpu_info():
+    """GPU identity and driver telemetry; unknown utilization stays unknown."""
+    gpus = []
+    for card in sorted(Path("/sys/class/drm").glob("card[0-9]*")):
+        if re.search(r"-", card.name):
+            continue
+        device = card / "device"
+        try:
+            vendor = (device / "vendor").read_text().strip()
+            pci_id = (device / "device").read_text().strip()
+            driver = Path(os.path.realpath(device / "driver")).name
+        except OSError:
+            continue
+        name = {"0x8086": "Intel integrated graphics", "0x10de": "NVIDIA graphics",
+                "0x1002": "AMD graphics"}.get(vendor, f"GPU {vendor}")
+        item = {"card": card.name, "name": name, "vendor": vendor, "device": pci_id,
+                "driver": driver, "usage": None, "memory_used": None, "memory_total": None,
+                "frequency_mhz": None, "temperature": None, "rc6_residency_ms": None,
+                "kind": "shared" if vendor == "0x8086" else "unknown"}
+        for path, key in (("mem_info_vram_used", "memory_used"), ("mem_info_vram_total", "memory_total"),
+                          ("gpu_busy_percent", "usage"), ("gt_cur_freq_mhz", "frequency_mhz")):
+            try:
+                item[key] = int((device / path).read_text().strip())
+            except (OSError, ValueError):
+                pass
+        if item["frequency_mhz"] is None:
+            for freq_path in (device / f"drm/{card.name}/gt/gt0/rps_cur_freq_mhz",
+                              device / f"drm/{card.name}/gt/gt0/rps_act_freq_mhz"):
+                try:
+                    item["frequency_mhz"] = int(freq_path.read_text().strip())
+                    break
+                except (OSError, ValueError):
+                    continue
+        try:
+            item["rc6_residency_ms"] = int((device / f"drm/{card.name}/gt/gt0/rc6_residency_ms").read_text().strip())
+        except (OSError, ValueError):
+            pass
+        if vendor == "0x10de" and shutil.which("nvidia-smi"):
+            try:
+                query = subprocess.run(["nvidia-smi", "--query-gpu=memory.used,memory.total,utilization.gpu,temperature.gpu,clocks.gr",
+                    "--format=csv,noheader,nounits"], capture_output=True, text=True, timeout=.8, check=False)
+                if query.returncode == 0 and query.stdout.strip():
+                    fields = [value.strip() for value in query.stdout.splitlines()[0].split(",")]
+                    item["memory_used"], item["memory_total"] = int(fields[0]) * 1024**2, int(fields[1]) * 1024**2
+                    item["usage"], item["temperature"], item["frequency_mhz"] = int(fields[2]), int(fields[3]), int(fields[4])
+            except (OSError, ValueError, IndexError, subprocess.TimeoutExpired):
+                pass
+        gpus.append(item)
+    return gpus
+
+
+def read_system_info():
+    core_ids = set()
+    for topology in Path("/sys/devices/system/cpu").glob("cpu[0-9]*/topology/core_id"):
+        try: core_ids.add(int(topology.read_text()))
+        except (OSError, ValueError): pass
+    info = {"Hostname": socket.gethostname(), "Kernel": platform.release(),
+            "Architecture": platform.machine(), "Logical CPUs": str(os.cpu_count() or "—"),
+            "Physical cores": str(len(core_ids)) if core_ids else "—"}
+    try:
+        for line in Path("/etc/os-release").read_text().splitlines():
+            if line.startswith("PRETTY_NAME="):
+                info["Operating system"] = line.split("=", 1)[1].strip().strip('"')
+                break
+    except OSError:
+        pass
+    try:
+        cpu_lines = Path("/proc/cpuinfo").read_text().splitlines()
+        info["Processor"] = next(line.split(":", 1)[1].strip() for line in cpu_lines
+                                 if line.startswith("model name"))
+    except (OSError, StopIteration):
+        pass
+    for key, path in (("Manufacturer", "/sys/class/dmi/id/sys_vendor"),
+                      ("Product", "/sys/class/dmi/id/product_name"),
+                      ("BIOS", "/sys/class/dmi/id/bios_version")):
+        try:
+            value = Path(path).read_text().strip()
+            if value and value != "None":
+                info[key] = value
+        except OSError:
+            pass
+    mem = read_meminfo()
+    if mem.get("MemTotal"):
+        info["Physical memory"] = fmt_bytes(mem["MemTotal"])
+    return info
+
+
+def read_battery_info():
+    batteries = []
+    for device in Path("/sys/class/power_supply").glob("*"):
+        try:
+            if (device / "type").read_text().strip() != "Battery":
+                continue
+            def read(name):
+                try:
+                    return (device / name).read_text().strip()
+                except OSError:
+                    return ""
+            batteries.append({"name": device.name, "model": read("model_name"),
+                "manufacturer": read("manufacturer"), "capacity": read("capacity"),
+                "status": read("status"), "energy_now": read("energy_now"),
+                "energy_full": read("energy_full"), "power_now": read("power_now"),
+                "voltage_now": read("voltage_now")})
+        except OSError:
+            continue
+    return batteries
 
 
 def read_meminfo():
@@ -160,52 +363,6 @@ def scan_processes(include_security=True):
     return procs, count, read_cpu_stat(), time.monotonic()
 
 
-def read_gpu_memory():
-    """Return dedicated GPU memory only when the driver exposes it."""
-    try:
-        result = subprocess.run(
-            ["nvidia-smi", "--query-gpu=memory.used,memory.total,utilization.gpu", "--format=csv,noheader,nounits"],
-            capture_output=True, text=True, timeout=0.8, check=False,
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            fields = [part.strip() for part in result.stdout.splitlines()[0].split(",")]
-            used, total = int(fields[0]), int(fields[1])
-            try: util = int(fields[2])
-            except (ValueError, IndexError): util = None
-            return {"name": "NVIDIA", "used": used * 1024**2, "total": total * 1024**2, "util": util, "kind": "dedicated"}
-    except (OSError, ValueError, IndexError, subprocess.TimeoutExpired):
-        pass
-    for card in sorted(Path("/sys/class/drm").glob("card[0-9]*")):
-        device = card / "device"
-        try:
-            total = int((device / "mem_info_vram_total").read_text().strip())
-            used = int((device / "mem_info_vram_used").read_text().strip())
-            return {"name": card.name, "used": used, "total": total, "util": None, "kind": "dedicated"}
-        except (OSError, ValueError):
-            continue
-    return {"name": "Integrated/shared", "used": None, "total": None, "util": None, "kind": "shared"}
-
-
-def read_network_counters():
-    """Aggregate physical network counters; does not attribute traffic to apps."""
-    totals = {"rx": 0, "tx": 0, "interfaces": []}
-    for interface in Path("/sys/class/net").iterdir():
-        name = interface.name
-        if name == "lo" or name.startswith(("veth", "docker", "br-", "virbr", "tun", "tap")):
-            continue
-        try:
-            if (interface / "operstate").read_text().strip() not in ("up", "unknown"):
-                continue
-            rx = int((interface / "statistics/rx_bytes").read_text().strip())
-            tx = int((interface / "statistics/tx_bytes").read_text().strip())
-            wifi = (interface / "wireless").exists()
-            totals["rx"] += rx; totals["tx"] += tx
-            totals["interfaces"].append({"name": name, "wifi": wifi})
-        except (OSError, ValueError):
-            continue
-    return totals
-
-
 def fmt_bytes(value):
     value = max(0, int(value or 0))
     for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
@@ -263,7 +420,7 @@ class HistoryChart(QWidget):
             painter.drawText(18, 58, "No history samples available")
             painter.end()
             return
-        left, top, right, bottom = 58, 34, 16, 34
+        left, top, right, bottom = 58, 34, 16, 54
         width = max(1, self.width() - left - right)
         height = max(1, self.height() - top - bottom)
         all_values = [v for values in self.series.values() for v in values if v == v]
@@ -297,14 +454,17 @@ class HistoryChart(QWidget):
         if self.times:
             painter.drawText(int(left), self.height() - 7, self.times[0])
             painter.drawText(int(left + width - 90), self.height() - 7, self.times[-1])
-        if self.title.lower().startswith(("memory", "ram disponible")):
-            legend_x = left + 12
-            for index, name in enumerate(self.series):
-                painter.setPen(QPen(QColor(self.PALETTE[index % len(self.PALETTE)]), 3))
-                painter.drawLine(int(legend_x), self.height() - 20, int(legend_x + 14), self.height() - 20)
-                painter.setPen(QColor("#c7c8cc"))
-                painter.drawText(int(legend_x + 19), self.height() - 16, name[:22])
-                legend_x += min(150, 35 + len(name) * 7)
+        legend_x, legend_y = left, self.height() - 24
+        for index, name in enumerate(self.series):
+            if legend_x > self.width() - 130:
+                legend_x = left
+                legend_y -= 17
+            painter.setPen(QPen(QColor(self.PALETTE[index % len(self.PALETTE)]), 3))
+            painter.drawLine(int(legend_x), int(legend_y - 4), int(legend_x + 12), int(legend_y - 4))
+            painter.setPen(QColor("#c7c8cc"))
+            label = name[:18]
+            painter.drawText(int(legend_x + 17), int(legend_y), label)
+            legend_x += min(180, 28 + len(label) * 7)
         painter.end()
 
 
@@ -382,49 +542,9 @@ class ProcessDetails(QDialog):
 class CircularGauge(QWidget):
     def __init__(self, title, parent=None):
         super().__init__(parent)
-        self.title = title
-        self.value_text = "—"
-        self.fraction = None
-        self.subtitle = ""
-        self.setMinimumSize(112, 112)
-        self.setSizePolicy(self.sizePolicy().Policy.Expanding, self.sizePolicy().Policy.Fixed)
-        self.setFixedHeight(148)
-
-    def set_metric(self, value_text, fraction=None, subtitle=""):
-        self.value_text = value_text
-        self.fraction = max(0.0, min(1.0, float(fraction))) if fraction is not None else None
-        self.subtitle = subtitle
-        self.update()
-
-    def paintEvent(self, event):
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        w, h = self.width(), self.height()
-        diameter = min(78, h - 46, w - 12)
-        diameter = max(48, diameter)
-        x, y = (w - diameter) / 2, 26
-        painter.setPen(QColor("#c8cbd2"))
-        painter.drawText(4, 17, w - 8, 18, Qt.AlignmentFlag.AlignHCenter, self.title)
-        painter.setPen(QPen(QColor("#30343b"), 7, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
-        painter.drawArc(int(x), int(y), int(diameter), int(diameter), 90 * 16, -360 * 16)
-        if self.fraction is not None:
-            painter.setPen(QPen(QColor("#48b8e8"), 7, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
-            painter.drawArc(int(x), int(y), int(diameter), int(diameter), 90 * 16, int(-360 * self.fraction * 16))
-        painter.setPen(QColor("#f2f3f5"))
-        font = painter.font(); font.setBold(True); font.setPointSize(11); painter.setFont(font)
-        painter.drawText(int(x), int(y + diameter/2 - 12), int(diameter), 24, Qt.AlignmentFlag.AlignCenter, self.value_text)
-        painter.setPen(QColor("#9a9da6"))
-        font = painter.font(); font.setBold(False); font.setPointSize(8); painter.setFont(font)
-        painter.drawText(2, int(y + diameter + 18), w - 4, 18, Qt.AlignmentFlag.AlignHCenter, self.subtitle)
-        painter.end()
-
-
-class CircularGauge(QWidget):
-    def __init__(self, title, parent=None):
-        super().__init__(parent)
         self.title, self.value_text, self.fraction, self.subtitle = title, "—", None, ""
-        self.setMinimumSize(112, 112)
-        self.setFixedHeight(148)
+        self.setMinimumSize(132, 154)
+        self.setFixedHeight(154)
 
     def set_metric(self, value_text, fraction=None, subtitle=""):
         self.value_text = value_text
@@ -436,10 +556,10 @@ class CircularGauge(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         w, h = self.width(), self.height()
-        diameter = max(48, min(78, h - 46, w - 12))
-        x, y = (w - diameter) / 2, 26
+        diameter = max(48, min(70, h - 58, w - 16))
+        x, y = (w - diameter) / 2, 34
         painter.setPen(QColor("#c8cbd2"))
-        painter.drawText(4, 17, w - 8, 18, Qt.AlignmentFlag.AlignHCenter, self.title)
+        painter.drawText(4, 19, w - 8, 16, Qt.AlignmentFlag.AlignHCenter, self.title)
         painter.setPen(QPen(QColor("#30343b"), 7, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
         painter.drawArc(int(x), int(y), int(diameter), int(diameter), 90 * 16, -360 * 16)
         if self.fraction is not None:
@@ -450,7 +570,7 @@ class CircularGauge(QWidget):
         painter.drawText(int(x), int(y + diameter/2 - 12), int(diameter), 24, Qt.AlignmentFlag.AlignCenter, self.value_text)
         painter.setPen(QColor("#9a9da6"))
         font = painter.font(); font.setBold(False); font.setPointSize(8); painter.setFont(font)
-        painter.drawText(2, int(y + diameter + 18), w - 4, 18, Qt.AlignmentFlag.AlignHCenter, self.subtitle)
+        painter.drawText(2, int(y + diameter + 17), w - 4, 16, Qt.AlignmentFlag.AlignHCenter, self.subtitle)
         painter.end()
 
 
@@ -465,6 +585,11 @@ class NRGWindow(QMainWindow):
         self.language = "en"
         self.previous_network = None
         self.network_rates = (0.0, 0.0)
+        self.previous_cores = {}
+        self.previous_disks = {}
+        self.previous_gpu_rc6 = {}
+        self.interface_rates = {}
+        self.hardware_history = []
         self.process_spawn_high = 0
         self.process_spawn_warning = False
         self.process_baseline_ready = False
@@ -477,6 +602,9 @@ class NRGWindow(QMainWindow):
         self._build_ui()
         self.timer = QTimer(self); self.timer.timeout.connect(self.refresh)
         self.timer.start(REFRESH_MS)
+        self.history_timer = QTimer(self)
+        self.history_timer.timeout.connect(self.refresh_history)
+        self.history_timer.start(30_000)
         self.refresh()
         self.refresh_history()
 
@@ -509,8 +637,9 @@ class NRGWindow(QMainWindow):
         root.addLayout(head)
         self.tabs = QTabWidget()
         self.tabs.setUsesScrollButtons(True)
+        self.tabs.currentChanged.connect(lambda index: self.refresh_history() if index == 4 else None)
         root.addWidget(self.tabs)
-        self._dashboard(); self._process_tab(); self._applications_tab(); self._history_tab(); self._diagnostics_tab()
+        self._dashboard(); self._hardware_tab(); self._process_tab(); self._applications_tab(); self._history_tab(); self._diagnostics_tab()
         self.language_box.currentIndexChanged.connect(self.change_language)
         self.language = self.language_box.currentData() or "en"
         page_scroll = QScrollArea()
@@ -574,6 +703,47 @@ class NRGWindow(QMainWindow):
         self.dashboard_note = QLabel("System telemetry is read-only by default. Process controls require an explicit selection; no kernel or cgroup limits are changed.")
         self.dashboard_note.setObjectName("muted"); self.dashboard_note.setWordWrap(True); layout.addWidget(self.dashboard_note)
         self.tabs.addTab(page, "Overview")
+
+    def _hardware_table(self, headers):
+        table = QTableWidget(0, len(headers))
+        table.setHorizontalHeaderLabels(headers)
+        table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        table.setAlternatingRowColors(True)
+        table.setSortingEnabled(False)
+        table.verticalHeader().setVisible(False)
+        table.horizontalHeader().setStretchLastSection(True)
+        return table
+
+    def _hardware_tab(self):
+        page, layout = QWidget(), QVBoxLayout()
+        page.setLayout(layout)
+        self.hardware_summary = QLabel("Live hardware inventory · kernel interfaces")
+        self.hardware_summary.setObjectName("section")
+        layout.addWidget(self.hardware_summary)
+        self.hardware_system = self._hardware_table(["System property", "Value"])
+        layout.addWidget(self.hardware_system)
+        self.hardware_cpu = self._hardware_table(["Logical CPU", "Physical core", "Usage", "Temperature"])
+        self.hardware_gpu = self._hardware_table(["GPU", "Driver", "Utilization", "Memory", "Frequency", "Temperature"])
+        self.hardware_network = self._hardware_table(["Interface", "Type / state", "Link / signal", "Download", "Upload", "IPv4", "IPv6", "Errors"])
+        self.hardware_disks = self._hardware_table(["Device", "Model", "Capacity", "Read", "Write", "Busy"])
+        self.hardware_thermals = self._hardware_table(["Sensor", "Component", "Temperature / value"])
+        self.hardware_section_labels = {}
+        for key, title, table in (("cpu", "CPU · per logical core", self.hardware_cpu),
+                                  ("gpu", "Graphics processors", self.hardware_gpu),
+                                  ("network", "Network interfaces", self.hardware_network),
+                                  ("disk", "Storage devices", self.hardware_disks),
+                                  ("sensors", "Thermal / hardware sensors", self.hardware_thermals)):
+            heading = QLabel(title); heading.setObjectName("section")
+            self.hardware_section_labels[key] = heading
+            layout.addWidget(heading)
+            layout.addWidget(table)
+        self.hardware_note = QLabel("Metrics are read directly from Linux /proc, /sys, hwmon and network interfaces. Intel i915 GPU activity is estimated from RC6 idle residency, not measured engine busy; integrated graphics share system RAM rather than dedicated VRAM. Unsupported hardware values are shown as unavailable.")
+        self.hardware_note.setWordWrap(True); self.hardware_note.setObjectName("muted"); layout.addWidget(self.hardware_note)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        scroll.setWidget(page)
+        self.tabs.addTab(scroll, "Hardware")
 
     def _process_tab(self):
         page, layout = QWidget(), QVBoxLayout(); page.setLayout(layout)
@@ -641,6 +811,8 @@ class NRGWindow(QMainWindow):
         content, charts_layout = QWidget(), QVBoxLayout()
         content.setLayout(charts_layout)
         self.history_charts = {
+            "cpu": HistoryChart("CPU utilization by logical core (%)"),
+            "gpu": HistoryChart("GPU activity estimate (%) · driver-supported metrics only"),
             "memory": HistoryChart("Memory available and swap (GiB)"),
             "pressure": HistoryChart("Pressure Stall Information (PSI %)"),
             "workloads": HistoryChart("Largest application workloads (MiB)"),
@@ -656,7 +828,7 @@ class NRGWindow(QMainWindow):
         charts_layout.addWidget(self.history_workload_table)
         charts_layout.addStretch()
         scroll.setWidget(content); layout.addWidget(scroll,1)
-        self.history_note = QLabel("History comes from the independent NRG monitor service. The GUI does not need to remain open to collect it.")
+        self.history_note = QLabel("RAM / PSI / workload history is stored by the NRG service. CPU per-core and GPU history is session-only while this window is open.")
         self.history_note.setObjectName("muted"); layout.addWidget(self.history_note)
         self.tabs.addTab(page,"History")
 
@@ -725,20 +897,42 @@ class NRGWindow(QMainWindow):
             disk_stat = os.statvfs(Path.home())
             disk_total = disk_stat.f_blocks * disk_stat.f_frsize
             disk_free = disk_stat.f_bavail * disk_stat.f_frsize
-            sensors = read_ksystemstats()
-            gpu = read_gpu_memory()
-            kde_gpu_used = sensors.get("gpu/all/usedVram")
-            kde_gpu_total = sensors.get("gpu/all/totalVram")
-            if gpu["kind"] != "dedicated" and kde_gpu_total and kde_gpu_total > 0:
-                gpu = {"name":"KDE GPU sensor", "used":int(kde_gpu_used or 0),
-                       "total":int(kde_gpu_total), "util":sensors.get("gpu/gpu0/usage"), "kind":"dedicated"}
+            sensors = read_hwmon_sensors()
+            disks_now = read_block_devices()
+            batteries = read_battery_info()
+            gpu_list = read_gpu_info()
+            for gpu_item in gpu_list:
+                if gpu_item["usage"] is None and gpu_item["rc6_residency_ms"] is not None:
+                    old_rc6 = self.previous_gpu_rc6.get(gpu_item["card"])
+                    if old_rc6 is not None:
+                        idle_ms = max(0, gpu_item["rc6_residency_ms"] - old_rc6)
+                        gpu_item["usage"] = max(0.0, min(100.0, 100.0 * (1.0 - idle_ms / max(1.0, elapsed * 1000))))
+                        gpu_item["usage_source"] = "RC6 idle-residency estimate"
+                if gpu_item["rc6_residency_ms"] is not None:
+                    self.previous_gpu_rc6[gpu_item["card"]] = gpu_item["rc6_residency_ms"]
+            primary_gpu = gpu_list[0] if gpu_list else {"name": "GPU", "usage": None, "memory_used": None, "memory_total": None, "kind": "unknown"}
+            gpu = {"name": primary_gpu["name"], "used": primary_gpu["memory_used"] or 0,
+                   "total": primary_gpu["memory_total"], "util": primary_gpu["usage"],
+                   "kind": "dedicated" if primary_gpu["memory_total"] else "shared"}
             if gpu["kind"] == "dedicated":
                 gpu_text = f"{fmt_bytes(gpu['used'])} / {fmt_bytes(gpu['total'])}"
                 if gpu.get("util") is not None: gpu_text += f" · {gpu['util']}%"
             else:
                 gpu_text = ("Compartida con RAM del sistema / VRAM dedicada no expuesta" if self.language == "es"
                             else "Shared with system RAM / no dedicated VRAM exposed")
-            network = read_network_counters()
+            interfaces_now = read_network_interfaces()
+            network = {"rx": sum(x["rx"] for x in interfaces_now.values()),
+                       "tx": sum(x["tx"] for x in interfaces_now.values()),
+                       "interfaces": [{"name": name, "wifi": x["kind"] == "Wi-Fi"}
+                                      for name, x in interfaces_now.items()]}
+            self.interface_rates = {}
+            for ifname, info in interfaces_now.items():
+                old_info = (self.previous_network or {}).get("by_interface", {}).get(ifname)
+                self.interface_rates[ifname] = {
+                    "rx": max(0, info["rx"] - old_info["rx"]) / max(0.001, elapsed) if old_info else 0.0,
+                    "tx": max(0, info["tx"] - old_info["tx"]) / max(0.001, elapsed) if old_info else 0.0,
+                }
+            network["by_interface"] = interfaces_now
             if self.previous_network:
                 dt = max(0.001, elapsed)
                 rx_rate = max(0, network["rx"] - self.previous_network["rx"]) * 8 / dt / 1_000_000
@@ -752,15 +946,13 @@ class NRGWindow(QMainWindow):
                 ("swap",fmt_bytes(swap)),("cpu",f"{cpu_pct:.0f}%" if cpu_pct is not None else "—"),
                 ("processes",str(count)),("pressure",f"{pm.get('full',0):.2f}%"),
                 ("disk",fmt_bytes(disk_free)),("gpu",gpu_text),("network",network_text),
-                ("cpu_temp", f"{sensors.get('cpu/all/averageTemperature', sensors.get('cpu/all/maximumTemperature', 0)):.0f} °C" if sensors.get("cpu/all/averageTemperature", sensors.get("cpu/all/maximumTemperature", 0)) > 0 else "—"),
-                ("gpu_usage", f"{sensors['gpu/gpu0/usage']:.0f}%" if "gpu/gpu0/usage" in sensors else "—"),
-                ("gpu_temp", f"{sensors['gpu/gpu0/temperature']:.0f} °C" if sensors.get("gpu/gpu0/temperature", 0) > 0 else "—"),
-                ("battery", f"{sensors['power/123456789/charge']:.0f}%" if "power/123456789/charge" in sensors else self._sensor_value(sensors, "power/", "/charge", "%")),
-                ("wifi", self._sensor_value(sensors, "network/", "/signal", "%")),
-                ("disk_io", self._disk_io_text(sensors)),
-                ("fan", self._sensor_value(sensors, "lmsensors/", "/fan1", " RPM")
-                 if any("/fan" in key for key in sensors) else
-                 ("No expuesto" if self.language == "es" else "Not exposed")),
+                ("cpu_temp", f"{max((x['celsius'] for x in sensors['temperatures'] if x['chip'].startswith('coretemp')), default=0):.0f} °C" if any(x["chip"].startswith("coretemp") for x in sensors["temperatures"]) else "—"),
+                ("gpu_usage", f"{gpu.get('util'):.0f}%" if gpu.get("util") is not None else "—"),
+                ("gpu_temp", "—"),
+                ("battery", (f"{batteries[0]['capacity']}% · {batteries[0]['status']}" if batteries and batteries[0]["capacity"] else "—")),
+                ("wifi", read_wireless_signal()),
+                ("disk_io", self._block_io_text(disks_now, self.previous_disks, elapsed)),
+                ("fan", ", ".join(f"{x['rpm']:.0f} RPM" for x in sensors["fans"]) or ("No expuesto" if self.language == "es" else "Not exposed")),
             ]:
                 if key in self.metrics:
                     self.metrics[key].setText(value)
@@ -768,42 +960,143 @@ class NRGWindow(QMainWindow):
             swap_total = mem.get("SwapTotal", 0)
             swap_fraction = swap / swap_total if swap_total else None
             gpu_fraction = (gpu["used"] / gpu["total"] if gpu.get("total") else
-                            (sensors.get("gpu/gpu0/usage", 0) / 100 if "gpu/gpu0/usage" in sensors else None))
+                            (gpu.get("util") / 100 if gpu.get("util") is not None else None))
             self.metric_gauges["available"].title = "RAM DISPONIBLE" if self.language == "es" else "RAM AVAILABLE"
             self.metric_gauges["available"].set_metric(
-                f"{avail/1024**3:.1f} GiB", ram_fraction, f"{(ram_fraction or 0)*100:.0f}% used")
+                f"{avail/1024**3:.1f} GiB", (avail / total if total else None),
+                f"{(avail / total * 100):.0f}% available" if total else "")
             self.metric_gauges["cpu"].set_metric(f"{cpu_pct:.0f}%" if cpu_pct is not None else "—",
                 cpu_pct / 100 if cpu_pct is not None else None, "total")
             self.metric_gauges["gpu_usage"].set_metric(
-                f"{sensors['gpu/gpu0/usage']:.0f}%" if "gpu/gpu0/usage" in sensors else "—",
-                sensors.get("gpu/gpu0/usage", 0) / 100 if "gpu/gpu0/usage" in sensors else None,
-                gpu.get("name", "GPU"))
+                (f"{gpu.get('util'):.0f}% est." if primary_gpu.get("usage_source") else f"{gpu.get('util'):.0f}%")
+                if gpu.get("util") is not None else "—",
+                gpu_fraction, (gpu.get("name", "GPU") + (" · RC6 estimate" if primary_gpu.get("usage_source") else "")))
             self.metric_gauges["swap"].set_metric(f"{swap/1024**3:.1f} GiB", swap_fraction,
                 f"{(swap_fraction or 0)*100:.0f}% used" if swap_total else "not configured")
+            cores_now = read_cpu_cores()
+            core_values = cpu_core_percentages(cores_now, self.previous_cores)
+            self.previous_cores = cores_now
+            gpu_usage = primary_gpu["usage"]
+            self.hardware_history.append({"time": time.time(), "cpu": core_values, "gpu": gpu_usage})
+            self.hardware_history = self.hardware_history[-360:]
+            self._refresh_hardware_tables(cores_now, core_values, gpu_list, interfaces_now,
+                                          disks_now, sensors, elapsed, batteries)
+            self.previous_disks = disks_now
             self.update_health(avail,total,cpu_pct,pm,pc,pi,disk_free,disk_total)
             self.live.setText("LIVE  ·  "+time.strftime("%H:%M:%S"))
         except Exception as exc:
             self.live.setText(f"Collection error: {exc}")
 
     @staticmethod
-    def _sensor_value(sensors, prefix, suffix, unit):
-        match = next((value for key, value in sensors.items() if key.startswith(prefix) and key.endswith(suffix)), None)
-        return f"{match:.0f}{unit}" if match is not None and match > 0 else "—"
+    def _block_io_text(current, previous, elapsed):
+        reads = writes = 0
+        for name, item in current.items():
+            old = previous.get(name)
+            if old:
+                reads += max(0, item["read_sectors"] - old["read_sectors"]) * 512 / max(.001, elapsed)
+                writes += max(0, item["write_sectors"] - old["write_sectors"]) * 512 / max(.001, elapsed)
+        return f"{fmt_bytes(reads)}/s · {fmt_bytes(writes)}/s"
 
-    @staticmethod
-    def _disk_io_text(sensors):
-        if "disk/all/read" in sensors:
-            read_rate = sensors["disk/all/read"]
-        else:
-            read_rate = sum(v for k, v in sensors.items()
-                            if k.startswith("disk/nvme") and k.endswith("/read"))
-        if "disk/all/write" in sensors:
-            write_rate = sensors["disk/all/write"]
-        else:
-            write_rate = sum(v for k, v in sensors.items()
-                             if k.startswith("disk/nvme") and k.endswith("/write"))
-        if read_rate <= 0 and write_rate <= 0: return "—"
-        return f"{fmt_bytes(read_rate)}/s · {fmt_bytes(write_rate)}/s"
+    def _fill_hardware_table(self, table, rows):
+        table.setSortingEnabled(False)
+        table.setRowCount(len(rows))
+        for r, values in enumerate(rows):
+            for c, value in enumerate(values):
+                table.setItem(r, c, cell(value))
+        table.setSortingEnabled(False)
+
+    def _refresh_hardware_tables(self, cores, core_values, gpus, interfaces, disks, sensors, elapsed, batteries):
+        temps = sensors.get("temperatures", [])
+        core_temps = {int(item["label"].split()[-1]): item["celsius"] for item in temps
+                      if item["chip"].startswith("coretemp") and item["label"].startswith("Core ")
+                      and item["label"].split()[-1].isdigit()}
+        cpu_rows = []
+        for name, value in sorted(core_values.items(), key=lambda x: int(x[0][3:])):
+            try:
+                core_id = int((Path("/sys/devices/system/cpu") / name / "topology/core_id").read_text())
+            except (OSError, ValueError):
+                core_id = -1
+            temperature = core_temps.get(core_id)
+            cpu_rows.append((name.upper(), str(core_id) if core_id >= 0 else "—",
+                             f"{value:.1f}%" if value is not None else "—",
+                             f"{temperature:.0f} °C" if temperature is not None else "—"))
+        self._fill_hardware_table(self.hardware_cpu, cpu_rows)
+        system_labels = {"Hostname": "Host", "Kernel": "Kernel", "Architecture": "Architecture",
+                         "Logical CPUs": "Logical CPUs", "Operating system": "Operating system",
+                         "Processor": "Processor", "Manufacturer": "Manufacturer",
+                         "Product": "Product", "BIOS": "BIOS", "Physical memory": "Physical memory"}
+        if self.language == "es":
+            system_labels.update({"Hostname": "Equipo", "Kernel": "Kernel", "Architecture": "Arquitectura",
+                "Logical CPUs": "CPU lógicas", "Operating system": "Sistema operativo",
+                "Processor": "Procesador", "Manufacturer": "Fabricante", "Product": "Modelo",
+                "BIOS": "BIOS", "Physical memory": "Memoria física"})
+        system_rows = [(system_labels.get(k, k), v) for k, v in read_system_info().items()]
+        for battery in batteries:
+            system_rows.extend([
+                (f"Battery · {battery['name']}", f"{battery['capacity']}% · {battery['status']}"),
+                ("Battery model", battery["model"] or battery["manufacturer"] or "—"),
+                ("Battery voltage", f"{int(battery['voltage_now']) / 1_000_000:.2f} V" if battery["voltage_now"].isdigit() else "—"),
+                ("Battery power", f"{int(battery['power_now']) / 1_000_000:.2f} W" if battery["power_now"].isdigit() else "—"),
+            ])
+        self._fill_hardware_table(self.hardware_system, system_rows)
+        gpu_rows = []
+        gpu_temps = [item for item in temps if any(token in item["chip"].casefold() for token in ("amdgpu", "nvidia", "nouveau"))]
+        for gpu in gpus:
+            gpu_temp = next((item["celsius"] for item in gpu_temps
+                             if (gpu["vendor"] == "0x10de" and "nvidia" in item["chip"].casefold())
+                             or (gpu["vendor"] == "0x1002" and "amdgpu" in item["chip"].casefold())), None)
+            memory = (f"{fmt_bytes(gpu['memory_used'] or 0)} / {fmt_bytes(gpu['memory_total'])}"
+                      if gpu["memory_total"] else "Shared system RAM / no dedicated VRAM")
+            gpu_rows.append((gpu["name"], gpu["driver"],
+                (f"{gpu['usage']:.0f}% (estimate)" if gpu.get("usage_source") else f"{gpu['usage']:.0f}%")
+                if gpu["usage"] is not None else "Not exposed by driver",
+                memory, f"{gpu['frequency_mhz']} MHz" if gpu["frequency_mhz"] is not None else "—",
+                f"{gpu['temperature']} °C" if gpu["temperature"] is not None else "—"))
+        self._fill_hardware_table(self.hardware_gpu, gpu_rows)
+        net_rows = []
+        for name, info in sorted(interfaces.items()):
+            rates = self.interface_rates.get(name, {"rx": 0, "tx": 0})
+            addresses = info["addresses"]
+            errors = info["rx_errors"] + info["tx_errors"]
+            link = "—"
+            try:
+                speed = (Path("/sys/class/net") / name / "speed").read_text().strip()
+                if speed.isdigit() and int(speed) > 0:
+                    link = f"{speed} Mbps"
+            except OSError:
+                pass
+            if info["kind"] == "Wi-Fi":
+                try:
+                    for line in Path("/proc/net/wireless").read_text().splitlines()[2:]:
+                        if line.strip().startswith(name + ":"):
+                            fields = line.replace(":", " ").split()
+                            link = f"{float(fields[2]):.0f}/70 · {float(fields[3]):.0f} dBm"
+                            break
+                except (OSError, ValueError, IndexError):
+                    pass
+            net_rows.append((name, f"{info['kind']} · {info['state']}", link,
+                f"{fmt_bytes(rates['rx'])}/s", f"{fmt_bytes(rates['tx'])}/s",
+                ", ".join(addresses["ipv4"]) or "—", ", ".join(addresses["ipv6"]) or "—", str(errors)))
+        self._fill_hardware_table(self.hardware_network, net_rows)
+        disk_rows = []
+        for name, info in sorted(disks.items()):
+            old = self.previous_disks.get(name)
+            read_rate = max(0, info["read_sectors"] - old["read_sectors"]) * 512 / max(.001, elapsed) if old else 0
+            write_rate = max(0, info["write_sectors"] - old["write_sectors"]) * 512 / max(.001, elapsed) if old else 0
+            disk_rows.append((name, info["model"], fmt_bytes(info["bytes"]),
+                f"{fmt_bytes(read_rate)}/s", f"{fmt_bytes(write_rate)}/s",
+                f"{max(0, info['busy_ms'] - old['busy_ms']) / max(.001, elapsed * 10):.1f}%" if old else "—"))
+        self._fill_hardware_table(self.hardware_disks, disk_rows)
+        thermal_rows = []
+        for item in temps:
+            thermal_rows.append((item["chip"], item["label"], f"{item['celsius']:.1f} °C"))
+        for item in sensors.get("fans", []):
+            thermal_rows.append((item["chip"], item["label"], f"{item['rpm']:.0f} RPM"))
+        for item in sensors.get("voltages", []):
+            thermal_rows.append((item["chip"], item["label"], f"{item['volts']:.2f} V"))
+        for item in sensors.get("power", []):
+            thermal_rows.append((item["chip"], item["label"], f"{item['watts']:.2f} W"))
+        self._fill_hardware_table(self.hardware_thermals, thermal_rows)
 
     def update_process_metrics(self, procs,count,cpu_total,old_cpu,elapsed):
         total_ticks = max(1,cpu_total[0]-old_cpu[0]) if cpu_total and old_cpu else max(1,int(elapsed*CLK_TCK*CPU_COUNT))
@@ -1054,6 +1347,18 @@ class NRGWindow(QMainWindow):
                 next((w.get("memory_current_bytes", 0) / 1024**2 for w in item.get("workloads", []) if w.get("name") == name), 0)
                 for item in samples
             ]
+        session = self.hardware_history
+        if session:
+            session_times = [time.strftime("%H:%M:%S", time.localtime(x["time"])) for x in session]
+            cpu_series = {}
+            for core in sorted({name for sample in session for name in sample["cpu"]}, key=lambda n: int(n[3:])):
+                cpu_series[core.upper()] = [sample["cpu"].get(core) or 0 for sample in session]
+            self.history_charts["cpu"].set_data(cpu_series, session_times)
+            gpu_points = [sample["gpu"] for sample in session]
+            if any(value is not None for value in gpu_points):
+                self.history_charts["gpu"].set_data({"GPU": [value or 0 for value in gpu_points]}, session_times)
+            else:
+                self.history_charts["gpu"].set_data({}, [])
         self.history_charts["memory"].set_data(memory, times)
         self.history_charts["pressure"].set_data(pressure, times)
         self.history_charts["workloads"].set_data(workloads, times)
@@ -1439,10 +1744,11 @@ class NRGWindow(QMainWindow):
         if not hasattr(self, "tabs"): return
         self.subtitle.setText(tr("Nexus Resource Governor  /  local diagnostics", "Nexus Resource Governor  /  diagnóstico local"))
         self.tabs.setTabText(0, tr("Overview", "Resumen"))
-        self.tabs.setTabText(1, tr("Processes", "Procesos"))
-        self.tabs.setTabText(2, tr("Applications", "Aplicaciones"))
-        self.tabs.setTabText(3, tr("History", "Historial"))
-        self.tabs.setTabText(4, tr("Diagnosis & Profiles", "Diagnóstico y perfiles"))
+        self.tabs.setTabText(1, tr("Hardware", "Hardware"))
+        self.tabs.setTabText(2, tr("Processes", "Procesos"))
+        self.tabs.setTabText(3, tr("Applications", "Aplicaciones"))
+        self.tabs.setTabText(4, tr("History", "Historial"))
+        self.tabs.setTabText(5, tr("Diagnosis & Profiles", "Diagnóstico y perfiles"))
         titles = {
             "available": ("RAM AVAILABLE", "RAM DISPONIBLE"),
             "used": ("RAM IN USE", "RAM EN USO"),
@@ -1467,16 +1773,11 @@ class NRGWindow(QMainWindow):
         self.metric_gauges["gpu_usage"].title = tr("GPU UTILIZATION", "USO DE GPU")
         self.metric_gauges["swap"].title = tr("SWAP IN USE", "SWAP EN USO")
         for gauge in self.metric_gauges.values(): gauge.update()
-        self.metric_gauges["available"].title = tr("RAM AVAILABLE", "RAM DISPONIBLE")
-        self.metric_gauges["cpu"].title = tr("CPU UTILIZATION", "USO DE CPU")
-        self.metric_gauges["gpu_usage"].title = tr("GPU UTILIZATION", "USO DE GPU")
-        self.metric_gauges["swap"].title = tr("SWAP IN USE", "SWAP EN USO")
-        for gauge in self.metric_gauges.values(): gauge.update()
         self.alert_heading.setText(tr("Processes that deserve a closer look", "Procesos que requieren revisión"))
         self.dashboard_note.setText(tr(
             "System telemetry is read-only by default. Process controls require an explicit selection; no kernel or cgroup limits are changed.",
             "La telemetría es de solo lectura por defecto. El control de procesos requiere selección explícita; no se modifican kernel ni límites cgroup."))
-        self.alert_table.setHorizontalHeaderLabels([tr("Process", "Proceso"), "PID", tr("Signal", "Señal"), tr("Executable", "Ejecutable")])
+        self.alert_table.setHorizontalHeaderLabels([tr("Process", "Proceso"), "PID", tr("Signal", "Señal")])
         self.search.setPlaceholderText(tr("Filter by process, PID, owner or executable…", "Filtrar por proceso, PID, propietario o ejecutable…"))
         self.profile_label.setText(tr("Profile", "Perfil"))
         self.plan_button.setText(tr("Calculate memory plan", "Calcular plan de memoria"))
@@ -1486,17 +1787,37 @@ class NRGWindow(QMainWindow):
         self.plan_table.setHorizontalHeaderLabels([tr("Application", "Aplicación"), tr("Priority", "Prioridad"), tr("Current", "Actual"), tr("Proposed soft ceiling", "Techo flexible propuesto"), tr("Samples", "Muestras")])
         self.diag_output.setPlaceholderText(tr("System diagnosis output appears here.", "El diagnóstico del sistema aparecerá aquí."))
         self.process_actions_button.setText(tr("Manage selected process…", "Administrar proceso seleccionado…"))
-        self.tabs.setTabText(1, tr("Processes", "Procesos"))
-        self.tabs.setTabText(2, tr("Applications", "Aplicaciones"))
-        self.tabs.setTabText(3, tr("History", "Historial"))
-        self.tabs.setTabText(4, tr("Diagnosis & Profiles", "Diagnóstico y perfiles"))
+        self.tabs.setTabText(1, tr("Hardware", "Hardware"))
+        self.tabs.setTabText(2, tr("Processes", "Procesos"))
+        self.tabs.setTabText(3, tr("Applications", "Aplicaciones"))
+        self.tabs.setTabText(4, tr("History", "Historial"))
+        self.tabs.setTabText(5, tr("Diagnosis & Profiles", "Diagnóstico y perfiles"))
+        self.hardware_summary.setText(tr("Live hardware inventory · kernel interfaces", "Inventario de hardware en vivo · interfaces del kernel"))
+        self.hardware_note.setText(tr(
+            "Metrics are read directly from Linux /proc, /sys, hwmon and network interfaces. Intel i915 GPU activity is estimated from RC6 idle residency, not measured engine busy; integrated graphics share system RAM rather than dedicated VRAM. Unsupported values are shown as unavailable.",
+            "Las métricas se leen directamente de /proc, /sys, hwmon e interfaces de red. La actividad de Intel i915 se estima mediante la residencia inactiva RC6, no mide directamente la actividad de motores; los gráficos integrados comparten RAM del sistema en vez de tener VRAM dedicada. Los datos no expuestos se indican como no disponibles."))
+        for key, labels in {
+            "cpu": ("CPU · per logical core", "CPU · por núcleo lógico"),
+            "gpu": ("Graphics processors", "Procesadores gráficos"),
+            "network": ("Network interfaces", "Interfaces de red"),
+            "disk": ("Storage devices", "Unidades de almacenamiento"),
+            "sensors": ("Thermal / hardware sensors", "Sensores térmicos / hardware"),
+        }.items():
+            self.hardware_section_labels[key].setText(tr(*labels))
+        self.hardware_system.setHorizontalHeaderLabels([tr("System property", "Propiedad del sistema"), tr("Value", "Valor")])
+        self.hardware_cpu.setHorizontalHeaderLabels([tr("Logical CPU", "CPU lógico"), tr("Physical core", "Núcleo físico"), tr("Usage", "Uso"), tr("Temperature", "Temperatura")])
+        self.hardware_gpu.setHorizontalHeaderLabels([tr("GPU", "GPU"), tr("Driver", "Controlador"), tr("Utilization", "Uso"), tr("Memory", "Memoria"), tr("Frequency", "Frecuencia"), tr("Temperature", "Temperatura")])
+        self.hardware_network.setHorizontalHeaderLabels([tr("Interface", "Interfaz"), tr("Type / state", "Tipo / estado"), tr("Link / signal", "Enlace / señal"), tr("Download", "Descarga"), tr("Upload", "Subida"), "IPv4", "IPv6", tr("Errors", "Errores")])
+        self.hardware_disks.setHorizontalHeaderLabels([tr("Device", "Dispositivo"), tr("Model", "Modelo"), tr("Capacity", "Capacidad"), tr("Read", "Lectura"), tr("Write", "Escritura"), tr("Busy", "Actividad")])
+        self.hardware_thermals.setHorizontalHeaderLabels([tr("Sensor", "Sensor"), tr("Component", "Componente"), tr("Temperature / value", "Temperatura / valor")])
         self.history_heading.setText(tr("Resource history · last 60 minutes", "Historial de recursos · últimos 60 minutos"))
         self.history_refresh_button.setText(tr("Refresh history", "Actualizar historial"))
         self.history_workload_table.setHorizontalHeaderLabels([tr("Application", "Aplicación"), tr("Memory", "Memoria")])
-        self.history_workload_table.setHorizontalHeaderLabels([tr("Application", "Aplicación"), tr("Memory", "Memoria")])
         self.history_note.setText(tr(
-            "History comes from the independent NRG monitor service. The GUI does not need to remain open to collect it.",
-            "El historial lo genera el servicio independiente de NRG. La interfaz no necesita permanecer abierta para recopilar datos."))
+            "RAM / PSI / workload history is stored by the NRG service. CPU per-core and GPU history is session-only while this window is open.",
+            "El servicio NRG guarda RAM / PSI / aplicaciones. El historial por núcleo de CPU y GPU solo se recopila mientras esta ventana está abierta."))
+        self.history_charts["cpu"].title = tr("CPU utilization by logical core (%)", "Uso de CPU por núcleo lógico (%)")
+        self.history_charts["gpu"].title = tr("GPU activity estimate (%) · driver-supported metrics only", "Estimación de actividad GPU (%) · solo métricas compatibles con el controlador")
         self.history_charts["memory"].title = tr("Memory available and swap (GiB)", "RAM disponible e intercambio (GiB)")
         self.history_charts["pressure"].title = tr("Pressure Stall Information (PSI %)", "Presión del sistema (PSI %)")
         self.history_charts["workloads"].title = tr("Largest application workloads (MiB)", "Aplicaciones con mayor consumo (MiB)")

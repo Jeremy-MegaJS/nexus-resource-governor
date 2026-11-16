@@ -81,7 +81,7 @@ The project currently has a read-only Linux telemetry backend and a policy/Rescu
 - [x] Add a contracted-bandwidth network budget preview (simulation only; no traffic shaping).
 - [x] Add rapid process-count and per-parent child-burst review signals (heuristics only).
 - [x] Add guarded per-process signals, nice-value adjustment, and CPU affinity controls.
-- [x] Add optional KSystemStats sensor integration for CPU/GPU thermal/usage, battery, Wi-Fi signal, fan, and disk I/O where available.
+- [x] Replace optional KDE sensor integration with direct hwmon, DRM, power-supply, network, and block-device telemetry.
 - [x] Add opt-in speed test: bidirectional with speedtest-cli; bounded download-only fallback otherwise.
 - [x] Add a user toggle to disable anomaly heuristics and executable-path inspection while retaining the process manager.
 - [x] Add an Applications view grouped by cgroup v2 workload with cgroup memory.current and process drill-down.
@@ -90,6 +90,9 @@ The project currently has a read-only Linux telemetry backend and a policy/Rescu
 - [x] Resolve app names/icons from desktop entries, aggregate sibling cgroups, and filter system/autostart noise from the Applications view.
 - [x] Replace the false-positive deleted-executable alert with no signal unless supported by other evidence.
 - [x] Add an explicit Work profile alongside Gaming in the dry-run planner.
+- [x] Add an independent Hardware view for CPU topology, GPU, per-interface network/IP data, storage, battery, and hwmon sensors.
+- [x] Remove KSystemStats/D-Bus sensor dependency from NRG Desktop.
+- [x] Add session CPU-per-core and GPU activity charts; persist these histories through the background service in a future telemetry-schema update.
 - [ ] Add system tray integration and configurable refresh/telemetry cost modes.
 - [ ] Add persistent workload identity and editable per-app memory floors/ceilings.
 - [x] Add confirmation-gated STOP/CONT/TERM/KILL actions for the currently observed PIDs in a selected cgroup workload.
