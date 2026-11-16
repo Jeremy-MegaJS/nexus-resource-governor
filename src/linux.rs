@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io;
 use std::path::{Component, Path, PathBuf};
+use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const MEMINFO: &str = "/proc/meminfo";
@@ -15,6 +16,12 @@ pub(crate) struct Snapshot {
     pub(crate) platform: &'static str,
     pub(crate) memory: Memory,
     pub(crate) pressure: Pressure,
+    pub(crate) cpu_pressure: Pressure,
+    pub(crate) io_pressure: Pressure,
+    pub(crate) interrupts: Vec<InterruptSnapshot>,
+    pub(crate) graphics: Vec<GraphicsDevice>,
+    pub(crate) display_connectors: Vec<DisplayConnector>,
+    pub(crate) thermal_zones: Vec<ThermalZone>,
     pub(crate) zram: Option<Zram>,
     pub(crate) vmstat: BTreeMap<String, u64>,
     pub(crate) cgroup_v2: Option<CgroupSnapshot>,
@@ -42,6 +49,37 @@ pub(crate) struct Memory {
 pub(crate) struct Pressure {
     pub(crate) some: Option<PsiLine>,
     pub(crate) full: Option<PsiLine>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct InterruptSnapshot {
+    pub(crate) irq: String,
+    pub(crate) cpu_counts: Vec<u64>,
+    pub(crate) detail: String,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct GraphicsDevice {
+    pub(crate) card: String,
+    pub(crate) driver: Option<String>,
+    pub(crate) vendor: Option<String>,
+    pub(crate) device: Option<String>,
+    pub(crate) boot_vga: Option<bool>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct DisplayConnector {
+    pub(crate) name: String,
+    pub(crate) status: Option<String>,
+    pub(crate) enabled: Option<String>,
+    pub(crate) mode_count: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct ThermalZone {
+    pub(crate) zone: String,
+    pub(crate) kind: Option<String>,
+    pub(crate) temperature_millicelsius: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -214,6 +252,77 @@ impl Snapshot {
                 full.avg300.unwrap_or(0.0)
             ));
         }
+        for (label, pressure) in [("CPU", &self.cpu_pressure), ("I/O", &self.io_pressure)] {
+            if let Some(some) = &pressure.some {
+                out.push_str(&format!(
+                    "{label} PSI some: avg10={:.2}% avg60={:.2}% avg300={:.2}%\n",
+                    some.avg10.unwrap_or(0.0),
+                    some.avg60.unwrap_or(0.0),
+                    some.avg300.unwrap_or(0.0)
+                ));
+            }
+            if let Some(full) = &pressure.full {
+                out.push_str(&format!(
+                    "{label} PSI full: avg10={:.2}% avg60={:.2}% avg300={:.2}%\n",
+                    full.avg10.unwrap_or(0.0),
+                    full.avg60.unwrap_or(0.0),
+                    full.avg300.unwrap_or(0.0)
+                ));
+            }
+        }
+        if !self.graphics.is_empty() {
+            out.push_str("Graphics devices (sysfs identity; not GPU utilization):\n");
+            for gpu in &self.graphics {
+                out.push_str(&format!(
+                    "  {} driver={} vendor={} device={} boot_vga={}\n",
+                    gpu.card,
+                    gpu.driver.as_deref().unwrap_or("unknown"),
+                    gpu.vendor.as_deref().unwrap_or("unknown"),
+                    gpu.device.as_deref().unwrap_or("unknown"),
+                    gpu.boot_vga
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "unknown".to_owned())
+                ));
+            }
+        }
+        if !self.display_connectors.is_empty() {
+            out.push_str("DRM display connectors (sample-time state):\n");
+            for connector in &self.display_connectors {
+                out.push_str(&format!(
+                    "  {} status={} enabled={} modes={}\n",
+                    connector.name,
+                    connector.status.as_deref().unwrap_or("unknown"),
+                    connector.enabled.as_deref().unwrap_or("unknown"),
+                    connector.mode_count
+                ));
+            }
+        }
+        if !self.thermal_zones.is_empty() {
+            out.push_str("Thermal zones (millidegree sysfs readings):\n");
+            for zone in &self.thermal_zones {
+                let temp = zone
+                    .temperature_millicelsius
+                    .map(|v| format!("{:.1} °C", v as f64 / 1000.0))
+                    .unwrap_or_else(|| "unavailable".to_owned());
+                out.push_str(&format!(
+                    "  {} type={} temperature={}\n",
+                    zone.zone,
+                    zone.kind.as_deref().unwrap_or("unknown"),
+                    temp
+                ));
+            }
+        }
+        if !self.interrupts.is_empty() {
+            out.push_str(
+                "Selected interrupt counters (cumulative; IRQ 27 and relevant device handlers):\n",
+            );
+            for irq in &self.interrupts {
+                out.push_str(&format!(
+                    "  IRQ {} counts={:?} detail={}\n",
+                    irq.irq, irq.cpu_counts, irq.detail
+                ));
+            }
+        }
         if let Some(cgroup) = &self.cgroup_v2 {
             out.push_str(&format!("Current cgroup: {}\n", cgroup.path));
             push_metric(
@@ -291,6 +400,102 @@ impl Snapshot {
         }
         out
     }
+
+    pub fn to_diagnostic(&self) -> String {
+        let mut out = self.to_human();
+        out.push_str("\nFreeze triage (signals, not root-cause claims):\n");
+        let memory_full = self.pressure.full.as_ref().and_then(|p| p.avg10);
+        let cpu_full = self.cpu_pressure.full.as_ref().and_then(|p| p.avg10);
+        let io_full = self.io_pressure.full.as_ref().and_then(|p| p.avg10);
+        let available = self.memory.available_bytes;
+        let swap_used = self.memory.swap_used_bytes;
+        let swap_total = self.memory.swap_total_bytes;
+        if available.is_some_and(|v| v < 512 * 1024 * 1024) || memory_full.is_some_and(|v| v >= 0.5)
+        {
+            out.push_str("  MEMORY: active pressure signal; correlate with pgscan/allocstall and workload growth.\n");
+        } else {
+            out.push_str("  MEMORY: no strong sustained pressure signal in this sample.\n");
+        }
+        if cpu_full.is_some_and(|v| v >= 0.5) {
+            out.push_str("  CPU: runnable tasks are experiencing measurable stall pressure.\n");
+        } else {
+            out.push_str("  CPU: no strong CPU PSI full-stall signal in this sample.\n");
+        }
+        if io_full.is_some_and(|v| v >= 0.5) {
+            out.push_str("  STORAGE: I/O PSI indicates tasks stalled on I/O; inspect device latency and kernel logs.\n");
+        } else {
+            out.push_str("  STORAGE: no strong I/O PSI full-stall signal in this sample.\n");
+        }
+        if let (Some(used), Some(total)) = (swap_used, swap_total) {
+            if total > 0 && used.saturating_mul(100) / total >= 85 {
+                out.push_str("  SWAP: usage is at least 85%; this alone does not prove active memory pressure.\n");
+            }
+        }
+        if self.interrupts.iter().any(|irq| irq.irq == "27") {
+            out.push_str("  IRQ 27: counters/handler captured; a disabled IRQ must be confirmed from kernel journal messages, not inferred from counters alone.\n");
+        } else {
+            out.push_str("  IRQ 27: no matching /proc/interrupts row was available.\n");
+        }
+        out.push_str("  GRAPHICS: driver identity is reported where sysfs exposes it; this build does not yet measure GPU engine hangs or resets.\n");
+        let mut desktop_reported_no_outputs = false;
+        let mut swapchain_allocation_failures = false;
+        for (label, boot) in [
+            ("current boot", "0"),
+            ("previous boot", "-1"),
+            ("two boots ago", "-2"),
+            ("three boots ago", "-3"),
+        ] {
+            match read_kernel_events(boot) {
+                Ok(events) if !events.is_empty() => {
+                    out.push_str(&format!(
+                        "\nRelevant kernel journal events ({label}; filtered and bounded):\n"
+                    ));
+                    for event in events {
+                        out.push_str("  ");
+                        out.push_str(&event);
+                        out.push('\n');
+                    }
+                }
+                Ok(_) => out.push_str(&format!(
+                    "\nNo matching kernel journal events found for {label}.\n"
+                )),
+                Err(error) => out.push_str(&format!(
+                    "\nKernel journal unavailable for {label}: {error}\n"
+                )),
+            }
+            match read_graphics_session_events(boot) {
+                Ok(events) if !events.is_empty() => {
+                    for event in &events {
+                        let lower = event.to_ascii_lowercase();
+                        desktop_reported_no_outputs |= lower.contains("there are no outputs")
+                            || lower.contains("placeholder screen");
+                        swapchain_allocation_failures |=
+                            lower.contains("failed to allocate a graphics buffer for a swapchain");
+                    }
+                    out.push_str(&format!("\nRelevant desktop/graphics session events ({label}; filtered and bounded):\n"));
+                    for event in events {
+                        out.push_str("  ");
+                        out.push_str(&event);
+                        out.push('\n');
+                    }
+                }
+                Ok(_) => out.push_str(&format!(
+                    "\nNo matching desktop/graphics events found for {label}.\n"
+                )),
+                Err(error) => out.push_str(&format!(
+                    "\nUser session journal unavailable for {label}: {error}\n"
+                )),
+            }
+        }
+        if desktop_reported_no_outputs {
+            out.push_str("\nDISPLAY WARNING: the desktop journal reported that no display outputs were available. Correlate this with DRM connector status and the event timestamp.\n");
+        }
+        if swapchain_allocation_failures {
+            out.push_str("GRAPHICS WARNING: KWin reported swapchain buffer allocation failures in the retained session journal. This can disrupt presentation but does not alone prove a full-system freeze.\n");
+        }
+        out.push_str("\nCORRELATION: capture JSONL during the next freeze and record its local timestamp; a single snapshot cannot identify the cause.\n");
+        out
+    }
 }
 
 fn push_metric(out: &mut String, label: &str, value: Option<u64>) {
@@ -327,14 +532,9 @@ pub fn collect_snapshot() -> io::Result<Snapshot> {
         commit_limit_bytes: kib_to_bytes(mem.get("CommitLimit").copied()),
     };
 
-    let pressure = Pressure {
-        some: read_psi_line("/proc/pressure/memory", "some")
-            .ok()
-            .flatten(),
-        full: read_psi_line("/proc/pressure/memory", "full")
-            .ok()
-            .flatten(),
-    };
+    let pressure = read_pressure("/proc/pressure/memory");
+    let cpu_pressure = read_pressure("/proc/pressure/cpu");
+    let io_pressure = read_pressure("/proc/pressure/io");
 
     let timestamp_unix_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -342,11 +542,17 @@ pub fn collect_snapshot() -> io::Result<Snapshot> {
         .as_millis();
 
     Ok(Snapshot {
-        schema_version: 7,
+        schema_version: 9,
         timestamp_unix_ms,
         platform: "linux",
         memory,
         pressure,
+        cpu_pressure,
+        io_pressure,
+        interrupts: read_interrupts().unwrap_or_default(),
+        graphics: read_graphics_devices(),
+        display_connectors: read_display_connectors(),
+        thermal_zones: read_thermal_zones(),
         zram: read_zram("zram0").ok().flatten(),
         vmstat: read_vmstat()?,
         cgroup_v2: read_current_cgroup().ok().flatten(),
@@ -368,6 +574,355 @@ fn parse_meminfo(input: &str) -> BTreeMap<String, u64> {
 
 fn kib_to_bytes(value: Option<u64>) -> Option<u64> {
     value.map(|v| v.saturating_mul(1024))
+}
+
+fn is_relevant_kernel_event(line: &str) -> bool {
+    const MARKERS: &[&str] = &[
+        "nobody cared",
+        "disabling irq",
+        "irq 27",
+        "idma64",
+        "i2c_dw",
+        "i915",
+        "xe ",
+        "drm",
+        "gpu",
+        "hang",
+        "reset",
+        "watchdog",
+        "lockup",
+        "nvme",
+        "timeout",
+        "i/o error",
+        "thermal",
+        "thrott",
+        "acpi bios error",
+        "acpi error",
+        "firmware",
+        "out of memory",
+        "oom-kill",
+        "killed process",
+        "machine check",
+        "mce:",
+        "edac",
+        "hardware error",
+        "uncorrected",
+    ];
+    let lower = line.to_ascii_lowercase();
+    MARKERS.iter().any(|marker| lower.contains(marker))
+}
+
+fn parse_kernel_events(input: &str, max_events: usize) -> Vec<String> {
+    let mut events: Vec<String> = input
+        .lines()
+        .filter(|line| is_relevant_kernel_event(line))
+        .map(|line| line.chars().take(420).collect())
+        .collect();
+    if events.len() > max_events {
+        events = events.split_off(events.len() - max_events);
+    }
+    events
+}
+
+fn read_kernel_events(boot: &str) -> io::Result<Vec<String>> {
+    const PATTERN: &str = "nobody cared|Disabling IRQ|irq 27|idma64|i2c_dw|i915|GPU HANG|drm|gpu|hang|reset|watchdog|lockup|nvme|timeout|I/O error|thermal|thrott|ACPI BIOS Error|ACPI Error|firmware|out of memory|oom-kill|killed process|machine check|MCE|EDAC|hardware error|uncorrected";
+    let filtered = Command::new("journalctl")
+        .args([
+            "-k",
+            "-b",
+            boot,
+            "--no-pager",
+            "-o",
+            "short-iso",
+            "--grep",
+            PATTERN,
+            "--case-sensitive=no",
+            "-n",
+            "80",
+        ])
+        .output()?;
+    if filtered.status.success() {
+        return Ok(parse_kernel_events(
+            &String::from_utf8_lossy(&filtered.stdout),
+            40,
+        ));
+    }
+
+    // Older systemd versions may not support --grep; fall back to a bounded tail.
+    let fallback = Command::new("journalctl")
+        .args([
+            "-k",
+            "-b",
+            boot,
+            "--no-pager",
+            "-o",
+            "short-iso",
+            "-n",
+            "2500",
+        ])
+        .output()?;
+    if !fallback.status.success() {
+        return Err(io::Error::other(format!(
+            "journalctl exited with status {}",
+            fallback.status
+        )));
+    }
+    Ok(parse_kernel_events(
+        &String::from_utf8_lossy(&fallback.stdout),
+        40,
+    ))
+}
+
+fn is_relevant_graphics_event(line: &str) -> bool {
+    const MARKERS: &[&str] = &[
+        "egl",
+        "glx",
+        "atomic commit",
+        "failed to commit",
+        "pageflip",
+        "swapchain",
+        "graphics buffer",
+        "gpu process",
+        "gpu reset",
+        "main thread was hanging",
+        "qsgtexture",
+        "segfault",
+        "core dumped",
+        "drkonqi",
+        "renderer process gone",
+        "compositor",
+        "no outputs",
+        "placeholder screen",
+        "unexisting screen",
+        "org_kde_powerdevil",
+        "i915 gmbus",
+        "prop_subsystem:  drm",
+    ];
+    let lower = line.to_ascii_lowercase();
+    MARKERS.iter().any(|marker| lower.contains(marker))
+}
+
+fn parse_graphics_events(input: &str, max_events: usize) -> Vec<String> {
+    let mut events: Vec<String> = input
+        .lines()
+        .filter(|line| is_relevant_graphics_event(line))
+        .map(|line| line.chars().take(420).collect())
+        .collect();
+    if events.len() > max_events {
+        events = events.split_off(events.len() - max_events);
+    }
+    events
+}
+
+fn read_graphics_session_events(boot: &str) -> io::Result<Vec<String>> {
+    const PATTERN: &str = "EGL|GLX|atomic commit|failed to commit|pageflip|swapchain|graphics buffer|GPU process|GPU reset|main thread was hanging|QSGTexture|segfault|core dumped|drkonqi|renderer process gone|compositor|no outputs|placeholder screen|unexisting screen|org_kde_powerdevil|i915 gmbus";
+    let filtered = Command::new("journalctl")
+        .args([
+            "--user",
+            "-b",
+            boot,
+            "--no-pager",
+            "-o",
+            "short-iso",
+            "--grep",
+            PATTERN,
+            "--case-sensitive=no",
+            "-n",
+            "80",
+        ])
+        .output()?;
+    if filtered.status.success() {
+        return Ok(parse_graphics_events(
+            &String::from_utf8_lossy(&filtered.stdout),
+            40,
+        ));
+    }
+
+    let fallback = Command::new("journalctl")
+        .args([
+            "--user",
+            "-b",
+            boot,
+            "--no-pager",
+            "-o",
+            "short-iso",
+            "-n",
+            "2500",
+        ])
+        .output()?;
+    if !fallback.status.success() {
+        return Err(io::Error::other(format!(
+            "user journalctl exited with status {}",
+            fallback.status
+        )));
+    }
+    Ok(parse_graphics_events(
+        &String::from_utf8_lossy(&fallback.stdout),
+        40,
+    ))
+}
+
+fn read_pressure(path: &str) -> Pressure {
+    Pressure {
+        some: read_psi_line(path, "some").ok().flatten(),
+        full: read_psi_line(path, "full").ok().flatten(),
+    }
+}
+
+fn parse_interrupts(input: &str, max_entries: usize) -> Vec<InterruptSnapshot> {
+    const RELEVANT: &[&str] = &[
+        "idma64", "i2c_dw", "i915", "xe", "nvme", "xhci", "iwlwifi", "pciehp", "snd",
+    ];
+    input
+        .lines()
+        .filter_map(|line| {
+            let (irq, rest) = line.split_once(':')?;
+            let irq = irq.trim();
+            let mut fields = rest.split_whitespace().peekable();
+            let mut cpu_counts = Vec::new();
+            while let Some(value) = fields.peek() {
+                if let Ok(count) = value.parse::<u64>() {
+                    cpu_counts.push(count);
+                    fields.next();
+                } else {
+                    break;
+                }
+            }
+            let detail = fields.collect::<Vec<_>>().join(" ");
+            let lower = detail.to_ascii_lowercase();
+            if irq != "27" && !RELEVANT.iter().any(|needle| lower.contains(needle)) {
+                return None;
+            }
+            Some(InterruptSnapshot {
+                irq: irq.to_owned(),
+                cpu_counts,
+                detail: detail.chars().take(256).collect(),
+            })
+        })
+        .take(max_entries)
+        .collect()
+}
+
+fn read_interrupts() -> io::Result<Vec<InterruptSnapshot>> {
+    Ok(parse_interrupts(
+        &fs::read_to_string("/proc/interrupts")?,
+        32,
+    ))
+}
+
+fn read_graphics_devices() -> Vec<GraphicsDevice> {
+    let Ok(entries) = fs::read_dir("/sys/class/drm") else {
+        return Vec::new();
+    };
+    let mut entries: Vec<_> = entries
+        .flatten()
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .strip_prefix("card")
+                .is_some_and(|suffix| {
+                    !suffix.is_empty() && suffix.chars().all(|ch| ch.is_ascii_digit())
+                })
+        })
+        .collect();
+    entries.sort_by_key(|entry| entry.file_name());
+    let mut devices = Vec::new();
+    for entry in entries.into_iter().take(8) {
+        let card = entry.file_name().to_string_lossy().into_owned();
+        let base = entry.path().join("device");
+        let driver = fs::read_link(base.join("driver")).ok().and_then(|path| {
+            path.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        });
+        let read_text = |name: &str| {
+            fs::read_to_string(base.join(name))
+                .ok()
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty())
+        };
+        let boot_vga = read_text("boot_vga").and_then(|value| match value.as_str() {
+            "0" => Some(false),
+            "1" => Some(true),
+            _ => None,
+        });
+        devices.push(GraphicsDevice {
+            card,
+            driver,
+            vendor: read_text("vendor"),
+            device: read_text("device"),
+            boot_vga,
+        });
+    }
+    devices
+}
+
+fn is_drm_connector_name(name: &str) -> bool {
+    let Some((card, connector)) = name.split_once('-') else {
+        return false;
+    };
+    card.strip_prefix("card")
+        .is_some_and(|suffix| !suffix.is_empty() && suffix.chars().all(|ch| ch.is_ascii_digit()))
+        && !connector.is_empty()
+}
+
+fn read_display_connectors() -> Vec<DisplayConnector> {
+    let Ok(entries) = fs::read_dir("/sys/class/drm") else {
+        return Vec::new();
+    };
+    let mut entries: Vec<_> = entries
+        .flatten()
+        .filter(|entry| is_drm_connector_name(&entry.file_name().to_string_lossy()))
+        .collect();
+    entries.sort_by_key(|entry| entry.file_name());
+    entries
+        .into_iter()
+        .take(16)
+        .map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let base = entry.path();
+            let read_text = |field: &str| {
+                fs::read_to_string(base.join(field))
+                    .ok()
+                    .map(|value| value.trim().to_owned())
+                    .filter(|value| !value.is_empty())
+            };
+            let mode_count = fs::read_to_string(base.join("modes"))
+                .ok()
+                .map(|value| value.lines().filter(|line| !line.trim().is_empty()).count())
+                .unwrap_or(0);
+            DisplayConnector {
+                name,
+                status: read_text("status"),
+                enabled: read_text("enabled"),
+                mode_count,
+            }
+        })
+        .collect()
+}
+
+fn read_thermal_zones() -> Vec<ThermalZone> {
+    let mut zones = Vec::new();
+    for index in 0..16 {
+        let zone = format!("thermal_zone{index}");
+        let base = Path::new("/sys/class/thermal").join(&zone);
+        if !base.is_dir() {
+            continue;
+        }
+        let kind = fs::read_to_string(base.join("type"))
+            .ok()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty());
+        let temperature_millicelsius = fs::read_to_string(base.join("temp"))
+            .ok()
+            .and_then(|value| value.trim().parse::<i64>().ok());
+        zones.push(ThermalZone {
+            zone,
+            kind,
+            temperature_millicelsius,
+        });
+    }
+    zones
 }
 
 fn read_psi_line(path: &str, wanted: &str) -> io::Result<Option<PsiLine>> {
@@ -1279,6 +1834,70 @@ mod tests {
         );
         assert_eq!(read, 5120);
         assert_eq!(write, 10240);
+    }
+
+    #[test]
+    fn drm_connector_name_filter_excludes_cards_and_render_nodes() {
+        assert!(is_drm_connector_name("card1-eDP-1"));
+        assert!(is_drm_connector_name("card1-HDMI-A-1"));
+        assert!(!is_drm_connector_name("card1"));
+        assert!(!is_drm_connector_name("renderD128"));
+        assert!(!is_drm_connector_name("cardx-DP-1"));
+    }
+
+    #[test]
+    fn graphics_event_filter_keeps_compositor_and_egl_failures() {
+        let input = "systemd started user manager\nkwin_wayland: atomic commit failed\nchatgpt: EGL Driver message glXGetMscRateOML failed\nplasmashell: tooltip warning\n";
+        let parsed = parse_graphics_events(input, 2);
+        assert_eq!(parsed.len(), 2);
+        assert!(parsed[0].contains("atomic commit failed"));
+        assert!(parsed[1].contains("EGL Driver message"));
+    }
+
+    #[test]
+    fn graphics_event_filter_keeps_display_output_loss_and_hotplug_events() {
+        let input = "kded6: There are no outputs - creating placeholder screen\norg_kde_powerdevil: prop_subsystem: drm\n";
+        let parsed = parse_graphics_events(input, 8);
+        assert_eq!(parsed.len(), 2);
+        assert!(parsed[0].contains("There are no outputs"));
+        assert!(parsed[1].contains("prop_subsystem: drm"));
+    }
+
+    #[test]
+    fn graphics_event_filter_returns_empty_for_unrelated_logs() {
+        assert!(parse_graphics_events("pipewire started\n", 40).is_empty());
+    }
+
+    #[test]
+    fn kernel_event_filter_keeps_freeze_relevant_lines_and_is_bounded() {
+        let input = "normal boot line\nirq 27: nobody cared\ni915 GPU HANG: reset\nACPI BIOS Error: bad thermal sensor\n";
+        let parsed = parse_kernel_events(input, 2);
+        assert_eq!(parsed.len(), 2);
+        assert!(parsed[0].contains("i915 GPU HANG"));
+        assert!(parsed[1].contains("ACPI BIOS Error"));
+    }
+
+    #[test]
+    fn kernel_event_filter_returns_empty_for_unrelated_logs() {
+        assert!(parse_kernel_events("systemd started user manager\n", 40).is_empty());
+    }
+
+    #[test]
+    fn parses_relevant_interrupt_counters_and_bounds_details() {
+        let input = "CPU0 CPU1\n 27: 10 20 IR-IO-APIC 27-fasteoi idma64.1\n 31: 5 7 IR-IO-APIC 31-fasteoi nvme0q1\n 44: 9 9 IR-PCI-MSI unrelated\n";
+        let parsed = parse_interrupts(input, 8);
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].irq, "27");
+        assert_eq!(parsed[0].cpu_counts, vec![10, 20]);
+        assert!(parsed[0].detail.contains("idma64.1"));
+        assert_eq!(parsed[1].irq, "31");
+        assert!(parsed[1].detail.contains("nvme0q1"));
+    }
+
+    #[test]
+    fn interrupt_parser_respects_entry_limit() {
+        let input = "27: 1 2 idma64\n28: 3 4 i2c_dw\n29: 5 6 nvme\n";
+        assert_eq!(parse_interrupts(input, 2).len(), 2);
     }
 
     #[test]

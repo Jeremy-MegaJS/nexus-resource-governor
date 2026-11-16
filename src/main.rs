@@ -14,8 +14,19 @@ fn main() {
 
     if mode == "--help" || mode == "-h" {
         println!(
-            "nrg-agent [--json|--human|--watch [INTERVAL_MS]|--policy|--rescue-plan TARGET EXTRA_MIB]\n\nRead-only Linux telemetry and dry-run policy evaluation. No system settings are changed.\n--policy evaluates the early OOM guard.\n--rescue-plan creates a user-action plan; it never pauses or closes apps."
+            "nrg-agent [--json|--human|--diagnose|--watch [INTERVAL_MS]|--policy|--rescue-plan TARGET EXTRA_MIB]\n\nRead-only Linux telemetry and dry-run policy evaluation. No system settings are changed.\n--policy evaluates the early OOM guard.\n--diagnose summarizes memory, CPU, I/O, IRQ, display, thermal, and bounded kernel/desktop journal signals.\n--rescue-plan creates a user-action plan; it never pauses or closes apps."
         );
+        return;
+    }
+
+    if mode == "--diagnose" {
+        match linux::collect_snapshot() {
+            Ok(snapshot) => println!("{}", snapshot.to_diagnostic()),
+            Err(error) => {
+                eprintln!("Could not collect diagnostic snapshot: {error}");
+                std::process::exit(1);
+            }
+        }
         return;
     }
 

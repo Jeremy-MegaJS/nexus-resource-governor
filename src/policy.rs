@@ -154,7 +154,7 @@ mod tests {
     fn fixture(available: u64) -> Snapshot {
         use crate::linux::{Memory, Pressure, PsiLine};
         Snapshot {
-            schema_version: 7,
+            schema_version: 9,
             timestamp_unix_ms: 0,
             platform: "linux",
             memory: Memory {
@@ -185,6 +185,18 @@ mod tests {
                     total_us: Some(0),
                 }),
             },
+            cpu_pressure: Pressure {
+                some: None,
+                full: None,
+            },
+            io_pressure: Pressure {
+                some: None,
+                full: None,
+            },
+            interrupts: Vec::new(),
+            graphics: Vec::new(),
+            display_connectors: Vec::new(),
+            thermal_zones: Vec::new(),
             zram: None,
             vmstat: Default::default(),
             cgroup_v2: None,

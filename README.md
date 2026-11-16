@@ -95,19 +95,23 @@ NRG cannot generically save every application's state. Graceful save/close suppo
 
 The first implementation is a read-only Rust CLI. It currently samples:
 - Physical memory and swap from /proc/meminfo.
-- Memory PSI from /proc/pressure/memory.
+- Memory, CPU, and I/O PSI from /proc/pressure.
+- Bounded interrupt counters for IRQ 27 and selected graphics/storage/input drivers.
+- DRM device/driver identity, connector status/modes, and thermal-zone readings from sysfs (no GPU engine utilization claim).
+- Filtered, bounded kernel and user-session journal events from the current boot and three preceding boots, including KWin/Plasma/XWayland/EGL messages when journal access is available.
 - ZRAM compression and physical-memory accounting from sysfs.
 - Selected paging and reclaim counters from /proc/vmstat.
 - The collector process's current cgroup v2 memory counters.
 - cgroup v2 controller availability, child-controller enablement, and a non-mutating write-open probe for the current cgroup (not a guarantee of systemd delegation).
 - Per-workload cgroup memory, CPU, process-count, and I/O counters from user application, session, and background slices.
 
-The watch mode emits one JSON snapshot per line and flushes each sample, making it useful for correlating resource pressure with freezes. The policy evaluator adds an early OOM-risk guard with NORMAL / WATCH / PRESSURE / CRITICAL states. Rescue Mode can generate a dry-run plan for a target application and requested temporary headroom, ranking other user applications that could be offered for save-and-close/pause.
+The watch mode emits one JSON snapshot per line and flushes each sample, making it useful for correlating resource pressure with freezes. Schema version 9 adds CPU/I/O PSI, bounded IRQ counters (including IRQ 27 when exposed), DRM driver identity and connector state, and thermal-zone readings. The --diagnose command presents these signals together with bounded relevant kernel and desktop-session events from the current boot and three preceding boots, without changing system state. It cannot yet identify GPU engine hangs directly or infer that an IRQ is disabled from counters alone. The policy evaluator adds an early OOM-risk guard with NORMAL / WATCH / PRESSURE / CRITICAL states. Rescue Mode can generate a dry-run plan for a target application and requested temporary headroom, ranking other user applications that could be offered for save-and-close/pause.
 
 These policy commands are currently advisory only:
 
 ```sh
 cargo run -- --policy
+cargo run -- --diagnose
 cargo run -- --rescue-plan brave 512
 ```
 

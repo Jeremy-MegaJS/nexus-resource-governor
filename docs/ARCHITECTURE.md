@@ -135,8 +135,10 @@ A hard cgroup memory limit can trigger OOM handling inside a workload. It is an 
 - cgroup v2 memory.current, memory.stat, memory.events, and memory.pressure.
 - memory.swap.current and memory.swap.max where available.
 - /proc/pressure/memory, /proc/pressure/cpu, and /proc/pressure/io.
-- /proc/meminfo, /proc/vmstat, and zram sysfs statistics.
+- /proc/meminfo, /proc/vmstat, selected bounded /proc/interrupts counters, and zram sysfs statistics.
+- DRM device/driver identity, bounded display-connector status/mode inventory, and thermal-zone readings from sysfs. These are diagnostic signals, not GPU engine utilization or GPU-hang detection.
 - Process metadata and systemd user-slice hierarchy. The read-only process sample exposes both executable basename and a bounded (512-character) `/proc/PID/exe` target path as identity hints; neither is treated as a unique application identity. Command-line arguments are intentionally not collected because they may contain secrets.
+- A bounded --diagnose report filters relevant kernel and user-session journal events from the current and three preceding boots, including KWin/Plasma, XWayland/EGL, DRM, IRQ, ACPI, thermal, and storage messages. Journal access is optional; unavailable logs are reported as unavailable, not interpreted as clean.
 
 The backend detects whether cgroup v2 controllers are available and delegated. It must not assume every distribution exposes identical permissions.
 
@@ -230,7 +232,7 @@ The OOM guard is an early-warning and coordination layer, not a replacement for 
 
 The Linux snapshot reports the controllers visible to the current cgroup, the controllers enabled for its children, whether memory accounting files are present, and whether cgroup.subtree_control can be opened for writing by the current process. The write-open check does not write to the control file and does not change system state.
 
-This is a capability signal, not proof that systemd delegated a complete writable subtree: creating child cgroups, enabling controllers, and managing processes require additional permissions and hierarchy checks. Enforcement must revalidate those permissions at the point of use and must never infer delegation from controller visibility alone. The snapshot schema was bumped to version 2 when capability reporting was added; version 3 added bounded process-correlation diagnostics; version 4 added parent-process relationship fields; version 5 adds a bounded parent-linked process sample and explicit truncation/edge metadata.
+This is a capability signal, not proof that systemd delegated a complete writable subtree: creating child cgroups, enabling controllers, and managing processes require additional permissions and hierarchy checks. Enforcement must revalidate those permissions at the point of use and must never infer delegation from controller visibility alone. The snapshot schema was bumped to version 2 when capability reporting was added; version 3 added bounded process-correlation diagnostics; version 4 added parent-process relationship fields; version 5 added a bounded parent-linked process sample and explicit truncation/edge metadata; version 6 added executable-path hints; version 7 added a bounded executable inventory; version 8 added CPU/I/O PSI, selected IRQ counters, graphics-driver identity, and thermal zones; version 9 added DRM connector status, enabled state, and mode counts. The separate --diagnose view reads bounded kernel and desktop-session journal excerpts but does not embed journal text into every JSONL sample.
 
 
 ## 15. Workload hierarchy and memory attribution

@@ -15,6 +15,7 @@ The project is in the requirements and architecture phase. The order prioritizes
 - [x] Add read-only Linux snapshot CLI for physical memory, swap, zram, memory PSI, selected vmstat counters, and current cgroup v2 metrics.
 - [x] Add parser tests and safe cgroup-path validation.
 - [x] Add JSONL watch mode with per-sample flush for pressure/freeze correlation.
+- [x] Add CPU/I/O PSI, bounded IRQ counters, DRM driver and connector identity, thermal zones, filtered kernel and desktop-session journal events from the current and three preceding boots, and a read-only freeze triage view.
 - [x] Detect cgroup v2 controllers, child-controller enablement, and current-cgroup subtree-control write access (read-only probe; delegation is not assumed).
 - [x] Collect per-workload memory, CPU, process-count, and I/O counters from user cgroup slices.
 - [x] Discover workloads from the per-user systemd cgroup hierarchy, independent of whether NRG runs in `app.slice`.
@@ -24,11 +25,12 @@ The project is in the requirements and architecture phase. The order prioritizes
 - [x] Add a bounded (32-node) ancestor-closed process graph rooted at the five highest-RSS processes, with same-workload parent validation and truncation metadata.
 - [x] Expose a bounded `/proc/PID/exe` target path alongside executable basename as an additional identity hint; do not collect command-line arguments.
 - [x] Aggregate a bounded, deterministic inventory of executable paths observed in each sampled workload; keep it explicitly as identity hints, not an asserted app identity.
-- [ ] Improve application identity beyond cgroup membership and executable metadata using confidence-scored, non-secret signals.
+- [ ] Add GPU engine/reset telemetry where exposed.
 - [ ] Provide a stable sampling API and bounded local history.
+- [ ] Improve application identity beyond cgroup membership and executable metadata using confidence-scored, non-secret signals.
 - [ ] Validate metrics against system tools under normal and stressed workloads.
 
-**Exit criteria:** NRG explains which workloads consume resources and whether the system is actually under pressure, without changing system state.
+**Exit criteria:** NRG explains which workloads consume resources, whether the system is under pressure, and correlates relevant display/kernel events without changing system state.
 
 ## Phase 2 — Policy engine and simulator
 - [x] Define a first portable policy input using normalized Linux telemetry.
