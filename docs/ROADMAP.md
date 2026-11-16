@@ -52,6 +52,7 @@ The project currently has a read-only Linux telemetry backend and a policy/Rescu
 - [ ] Add persisted workload identities and configurable long-lived budgets; current per-app thresholds are notification-only.
 - [x] Model expiring Rescue Mode budget overrides, capture original per-workload memory.high/memory.max, and emit a restore plan (dry-run only).
 - [x] Add a save-attestation/adapter-verification state machine with separate pause/close approval gates (no application adapters are registered yet).
+- [x] Recheck transaction expiry on every state transition and allow immediate user decline.
 - [x] Record before/after memory.current deltas as observations without claiming causality.
 - [ ] Implement a real adapter registry and user-facing save/close workflow.
 

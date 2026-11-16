@@ -120,7 +120,7 @@ cargo run -- --rescue-transaction brave 512 300
 
 `--budget-plan [balanced|gaming|study|development]` calculates profile-aware per-app soft-memory proposals from bounded historical P95 samples, current usage, and a system reserve. New apps receive a conservative bootstrap estimate until at least five samples exist. The planner prioritizes workloads by profile, preserves the captured memory.max, and refuses to propose limits if current-use safety floors cannot fit. It is dry-run only; no cgroup values are written. User-editable profiles and live enforcement are not implemented yet.
 
-`--rescue-plan` takes a case-insensitive workload-name fragment and extra MiB requested by the priority workload. `--rescue-transaction TARGET EXTRA_MIB [TTL_SECONDS]` (30–900 seconds; default 300) emits a transaction-shaped dry-run: it captures the target's previous `memory.high`/`memory.max`, proposes a soft `memory.high` only when a numeric prior value exists, records an expiry and restore plan, and models save verification plus separate pause/close approval. No cgroup values are written and no process is controlled. `memory.max` is never proposed for change. No application adapters are registered yet; a user attestation is not an application-confirmed save. Before/after `memory.current` is an observed delta, not proof that a particular action caused the decrease. Pausing a process does not itself free resident memory. Target delegation and ancestor limits are not yet validated, so enforcement remains disabled. The Linux kernel remains responsible for reclaiming file cache and swapping anonymous pages; NRG does not route allocations directly to swap. The Windows backend is not implemented.
+`--rescue-plan` takes a case-insensitive workload-name fragment and extra MiB requested by the priority workload. `--rescue-transaction TARGET EXTRA_MIB [TTL_SECONDS]` (30–900 seconds; default 300) emits a transaction-shaped dry-run: it captures the target's previous `memory.high`/`memory.max`, proposes a soft `memory.high` only when the current value is numeric, records an expiry and restore plan, and models save verification plus separate pause/close approval. Every state-changing simulation transition checks the expiry; expired plans reject further approvals and measurements, while the user can decline at any active stage. The expiry is metadata/state validation only—there is no persistent transaction daemon or automatic timer yet. No cgroup values are written and no process is controlled. `memory.max` is never proposed for change. No application adapters are registered yet; a user attestation is not an application-confirmed save. Before/after `memory.current` is an observed delta, not proof that a particular action caused the decrease. Pausing a process does not itself free resident memory. Target delegation and ancestor limits are not yet validated, so enforcement remains disabled. The Linux kernel remains responsible for reclaiming file cache and swapping anonymous memory; NRG does not route allocations directly to swap. The Windows backend is not implemented.
 
 Build and run on Linux:
 
@@ -128,7 +128,9 @@ Build and run on Linux:
 cargo test
 cargo run -- --human
 cargo run -- --json
-cargo run --release -- --monitor 2000
+# Build the monitor binary and prepare its private state directory:
+cargo build --release
+mkdir -p ~/.local/state/nrg
 # Install the user-session monitor at login:
 install -Dm644 packaging/systemd/nrg-monitor.service ~/.config/systemd/user/nrg-monitor.service
 systemctl --user daemon-reload
