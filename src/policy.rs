@@ -154,7 +154,7 @@ mod tests {
     fn fixture(available: u64) -> Snapshot {
         use crate::linux::{Memory, Pressure, PsiLine};
         Snapshot {
-            schema_version: 6,
+            schema_version: 7,
             timestamp_unix_ms: 0,
             platform: "linux",
             memory: Memory {
@@ -228,6 +228,7 @@ mod tests {
             top_processes: Vec::new(),
             process_tree: Vec::new(),
             process_tree_truncated: false,
+            executable_hints: Vec::new(),
         };
         snapshot.workloads = vec![
             workload(

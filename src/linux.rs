@@ -102,6 +102,14 @@ pub(crate) struct WorkloadSnapshot {
     pub(crate) top_processes: Vec<ProcessSnapshot>,
     pub(crate) process_tree: Vec<ProcessSnapshot>,
     pub(crate) process_tree_truncated: bool,
+    pub(crate) executable_hints: Vec<ExecutableHint>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct ExecutableHint {
+    pub(crate) path: String,
+    pub(crate) basename: String,
+    pub(crate) observed_processes: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -334,7 +342,7 @@ pub fn collect_snapshot() -> io::Result<Snapshot> {
         .as_millis();
 
     Ok(Snapshot {
-        schema_version: 6,
+        schema_version: 7,
         timestamp_unix_ms,
         platform: "linux",
         memory,
@@ -616,6 +624,7 @@ fn read_workloads() -> io::Result<Vec<WorkloadSnapshot>> {
                 top_processes: Vec::new(),
                 process_tree: Vec::new(),
                 process_tree_truncated: false,
+                executable_hints: Vec::new(),
             });
         }
     }
@@ -763,6 +772,7 @@ fn correlate_processes(workloads: &mut [WorkloadSnapshot]) {
         }
         if let Some(workload) = workloads.get_mut(workload_index) {
             workload.top_processes = top_processes;
+            workload.executable_hints = build_executable_hints(&tree, 8);
             workload.process_tree = tree;
             workload.process_tree_truncated = truncated;
         }
@@ -820,6 +830,37 @@ fn read_process_snapshot_for_workload(
         parent_in_tree: None,
         rss_estimate_bytes,
     })
+}
+
+fn build_executable_hints(processes: &[ProcessSnapshot], max_hints: usize) -> Vec<ExecutableHint> {
+    let mut counts = BTreeMap::<String, (String, usize)>::new();
+    for process in processes {
+        let (Some(path), Some(basename)) = (
+            process.executable_path.as_ref(),
+            process.executable.as_ref(),
+        ) else {
+            continue;
+        };
+        let entry = counts
+            .entry(path.clone())
+            .or_insert_with(|| (basename.clone(), 0));
+        entry.1 = entry.1.saturating_add(1);
+    }
+    let mut hints: Vec<_> = counts
+        .into_iter()
+        .map(|(path, (basename, observed_processes))| ExecutableHint {
+            path,
+            basename,
+            observed_processes,
+        })
+        .collect();
+    hints.sort_by(|a, b| {
+        b.observed_processes
+            .cmp(&a.observed_processes)
+            .then_with(|| a.path.cmp(&b.path))
+    });
+    hints.truncate(max_hints);
+    hints
 }
 
 fn build_ancestor_closed_process_tree(
@@ -1064,6 +1105,31 @@ mod tests {
     }
 
     #[test]
+    fn executable_hints_are_bounded_counted_and_deterministic() {
+        let mut first = process_fixture(1, None, Some(10));
+        first.executable = Some("browser".to_owned());
+        first.executable_path = Some("/usr/bin/browser".to_owned());
+        let mut second = process_fixture(2, None, Some(20));
+        second.executable = Some("browser".to_owned());
+        second.executable_path = Some("/usr/bin/browser".to_owned());
+        let mut third = process_fixture(3, None, Some(30));
+        third.executable = Some("renderer".to_owned());
+        third.executable_path = Some("/opt/app/renderer".to_owned());
+
+        let hints = build_executable_hints(&[third, first, second], 1);
+        assert_eq!(hints.len(), 1);
+        assert_eq!(hints[0].path, "/usr/bin/browser");
+        assert_eq!(hints[0].basename, "browser");
+        assert_eq!(hints[0].observed_processes, 2);
+    }
+
+    #[test]
+    fn executable_hints_ignore_incomplete_identity_metadata() {
+        let process = process_fixture(1, None, Some(10));
+        assert!(build_executable_hints(&[process], 8).is_empty());
+    }
+
+    #[test]
     fn parses_unified_process_cgroup_membership() {
         let parsed = parse_unified_process_cgroup(
             "12:memory:/legacy\n0::/user.slice/user-1000.slice/app.slice/app-demo.scope\n",
@@ -1110,6 +1176,7 @@ mod tests {
             top_processes: Vec::new(),
             process_tree: Vec::new(),
             process_tree_truncated: false,
+            executable_hints: Vec::new(),
         };
         let workloads = vec![workload];
         assert!(

@@ -61,7 +61,7 @@ A workload is a logical application instance, not merely a process name. It may 
 - User-selected classification (game, browser, editor, background task).
 - Optional application adapter.
 
-Names alone are not a safe identity: unrelated processes can share an executable name.
+Names alone are not a safe identity: unrelated processes can share an executable name. Linux snapshots therefore expose a bounded inventory of executable paths observed in the sampled process graph, with occurrence counts. This is diagnostic evidence only: the highest-RSS process is not assumed to be the application root, helper processes are not classified by guesswork, and the inventory is not a persistent workload identity.
 
 ### Budget
 
