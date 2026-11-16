@@ -605,6 +605,10 @@ impl Snapshot {
         let mut desktop_reported_no_outputs = false;
         let mut swapchain_allocation_failures = false;
         let mut atomic_commit_failures = false;
+        let mut irq27_disabled = false;
+        let mut irq27_unhandled = false;
+        let mut acpi_sensor_lookup_errors = false;
+        let mut gpu_hang_or_reset = false;
         for (label, boot) in [
             ("current boot", "0"),
             ("previous boot", "-1"),
@@ -617,6 +621,14 @@ impl Snapshot {
                         "\nRelevant kernel journal events ({label}; filtered and bounded):\n"
                     ));
                     for event in events {
+                        let lower = event.to_ascii_lowercase();
+                        irq27_disabled |= lower.contains("disabling irq #27");
+                        irq27_unhandled |= lower.contains("irq 27: nobody cared");
+                        acpi_sensor_lookup_errors |=
+                            lower.contains("tsr5") || lower.contains("sen5");
+                        gpu_hang_or_reset |= lower.contains("gpu hang")
+                            || lower.contains("gpu reset")
+                            || (lower.contains("i915") && lower.contains("reset"));
                         out.push_str("  ");
                         out.push_str(&event);
                         out.push('\n');
@@ -654,6 +666,21 @@ impl Snapshot {
                     "\nUser session journal unavailable for {label}: {error}\n"
                 )),
             }
+        }
+        if irq27_disabled || irq27_unhandled {
+            out.push_str(
+                "\nIRQ 27 WARNING: retained kernel logs show an unhandled interrupt storm and/or the kernel disabling IRQ 27. The associated handler is i2c_designware/idma64; this is historical evidence, not proof the IRQ is currently failing.\n",
+            );
+        }
+        if acpi_sensor_lookup_errors {
+            out.push_str(
+                "ACPI SENSOR WARNING: firmware repeatedly references the missing SEN5/TSR5 sensor object; thermal_zone6 has no reading. This makes that sensor unavailable and does not by itself prove a CPU thermal fault.\n",
+            );
+        }
+        if gpu_hang_or_reset {
+            out.push_str(
+                "GPU WARNING: retained kernel logs include a GPU hang/reset marker; correlate its timestamp with DRM connector and KWin presentation failures.\n",
+            );
         }
         if desktop_reported_no_outputs {
             out.push_str("\nDISPLAY WARNING: the desktop journal reported that no display outputs were available. Correlate this with DRM connector status and the event timestamp.\n");
@@ -2300,6 +2327,20 @@ mod tests {
         assert_eq!(parsed.len(), 2);
         assert!(parsed[0].contains("i915 GPU HANG"));
         assert!(parsed[1].contains("ACPI BIOS Error"));
+    }
+
+    #[test]
+    fn kernel_event_filter_keeps_irq27_acpi_sensor_and_gpu_fault_signatures() {
+        let input = "kernel: irq 27: nobody cared\nkernel: Disabling IRQ #27\nkernel: ACPI BIOS Error: SEN5 TSR5 AE_NOT_FOUND\nkernel: i915 GPU HANG: reset\n";
+        let parsed = parse_kernel_events(input, 8);
+        assert!(
+            parsed
+                .iter()
+                .any(|line| line.contains("irq 27: nobody cared"))
+        );
+        assert!(parsed.iter().any(|line| line.contains("Disabling IRQ #27")));
+        assert!(parsed.iter().any(|line| line.contains("SEN5")));
+        assert!(parsed.iter().any(|line| line.contains("GPU HANG")));
     }
 
     #[test]
