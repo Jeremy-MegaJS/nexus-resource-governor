@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""NRG Desktop: lightweight, read-only resource and process diagnostics."""
+"""NRG Desktop: resource monitoring, guarded process management, and diagnostics."""
 from __future__ import annotations
-import json, os, pwd, re, subprocess, sys, time
+import json, os, pwd, re, signal, shlex, shutil, subprocess, sys, time, urllib.request
 from pathlib import Path
-from PySide6.QtCore import Qt, QProcess, QTimer
+from PySide6.QtCore import Qt, QProcess, QTimer, QThread, Signal
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
-    QApplication, QComboBox, QDialog, QDialogButtonBox, QGridLayout,
-    QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox, QPushButton,
-    QTabWidget, QTableWidget, QTableWidgetItem, QTextEdit, QVBoxLayout,
+    QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QGridLayout,
+    QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMenu, QMessageBox, QPushButton,
+    QInputDialog, QTabWidget, QTableWidget, QTableWidgetItem, QTextEdit, QVBoxLayout,
     QWidget, QHeaderView,
 )
 
@@ -19,6 +19,52 @@ REFRESH_MS, MAX_ROWS = 5000, 120
 PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
 CLK_TCK = os.sysconf("SC_CLK_TCK")
 CPU_COUNT = os.cpu_count() or 1
+_KDE_SENSOR_IDS = None
+
+
+def read_ksystemstats():
+    """Read KDE's own hardware sensor service when available; all sensors remain optional."""
+    global _KDE_SENSOR_IDS
+    if _KDE_SENSOR_IDS is None:
+        try:
+            listed = subprocess.run(["kstatsviewer", "--list"], capture_output=True,
+                                    text=True, timeout=2.0, check=False)
+            ids = []
+            for line in listed.stdout.splitlines():
+                sensor = line.split(maxsplit=1)[0] if line.split() else ""
+                if (sensor in ("cpu/all/averageTemperature", "cpu/all/maximumTemperature")
+                    or sensor.startswith(("gpu/", "power/", "network/", "disk/", "lmsensors/"))
+                    and sensor.rsplit("/", 1)[-1] in (
+                        "usage", "temperature", "usedVram", "totalVram", "usedPercent",
+                        "charge", "health", "signal", "download", "upload", "read", "write",
+                        "fan1", "fan2", "temp1", "temp2", "temp3")):
+                    ids.append(sensor)
+            _KDE_SENSOR_IDS = list(dict.fromkeys(ids))[:48]
+        except (OSError, subprocess.TimeoutExpired):
+            _KDE_SENSOR_IDS = []
+    if not _KDE_SENSOR_IDS:
+        return {}
+    try:
+        command = ["busctl", "--user", "call", "org.kde.ksystemstats1",
+                   "/org/kde/ksystemstats1", "org.kde.ksystemstats1", "sensorData",
+                   "as", str(len(_KDE_SENSOR_IDS)), *_KDE_SENSOR_IDS]
+        result = subprocess.run(command, capture_output=True, text=True, timeout=1.2, check=False)
+        if result.returncode:
+            return {}
+        tokens = shlex.split(result.stdout)
+        values = {}
+        if len(tokens) < 2:
+            return values
+        index = 2
+        while index + 2 < len(tokens):
+            name, kind, raw = tokens[index:index+3]
+            index += 3
+            if kind in ("i", "u", "x", "t", "d", "n", "q"):
+                try: values[name] = float(raw)
+                except ValueError: pass
+        return values
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        return {}
 
 
 def read_meminfo():
@@ -52,7 +98,7 @@ def read_cpu_stat():
         return None
 
 
-def scan_processes():
+def scan_processes(include_security=True):
     """Read-only /proc inventory. Never reads command-line arguments or environments."""
     now, procs, count = time.monotonic(), [], 0
     for entry in os.scandir("/proc"):
@@ -76,9 +122,12 @@ def scan_processes():
                         uid = int(line.split()[1]); break
             except (OSError, ValueError, IndexError):
                 pass
-            try:
-                exe = os.readlink(base / "exe")
-            except OSError:
+            if include_security:
+                try:
+                    exe = os.readlink(base / "exe")
+                except OSError:
+                    exe = ""
+            else:
                 exe = ""
             read_bytes = write_bytes = 0
             try:
@@ -164,6 +213,45 @@ def cell(value, align=None):
     return obj
 
 
+class NetworkTestWorker(QThread):
+    completed = Signal(object)
+
+    def run(self):
+        cli = shutil.which("speedtest-cli")
+        if cli:
+            try:
+                result = subprocess.run([cli, "--secure", "--json"], capture_output=True,
+                                        text=True, timeout=90, check=False)
+                if result.returncode != 0:
+                    raise RuntimeError(result.stderr.strip() or f"speedtest-cli exit {result.returncode}")
+                data = json.loads(result.stdout)
+                self.completed.emit({
+                    "ok": True, "download_mbps": float(data["download"]) / 1_000_000,
+                    "upload_mbps": float(data["upload"]) / 1_000_000,
+                    "ping_ms": float(data.get("ping", 0)),
+                    "server": data.get("server", {}).get("name", "Speedtest server"),
+                    "provider": "Ookla speedtest-cli",
+                })
+                return
+            except Exception as exc:
+                self.completed.emit({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
+                return
+        try:
+            started = time.monotonic()
+            with urllib.request.urlopen("https://speed.cloudflare.com/__down?bytes=25000000", timeout=25) as response:
+                downloaded = 0
+                while True:
+                    chunk = response.read(1024 * 1024)
+                    if not chunk: break
+                    downloaded += len(chunk)
+            elapsed = max(0.001, time.monotonic() - started)
+            self.completed.emit({"ok": True, "download_mbps": downloaded * 8 / elapsed / 1_000_000,
+                                 "upload_mbps": None, "provider": "Cloudflare download endpoint",
+                                 "needs_upload_cli": True})
+        except Exception as exc:
+            self.completed.emit({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
+
+
 class ProcessDetails(QDialog):
     def __init__(self, proc, parent=None, language="en"):
         super().__init__(parent)
@@ -211,6 +299,10 @@ class NRGWindow(QMainWindow):
         self.process_baseline_ready = False
         self.parent_spawn_high = {}
         self.new_processes_last = 0
+        self.security_enabled = True
+        self.measured_down_mbps = None
+        self.measured_up_mbps = None
+        self.network_worker = None
         self._build_ui()
         self.timer = QTimer(self); self.timer.timeout.connect(self.refresh)
         self.timer.start(REFRESH_MS)
@@ -266,10 +358,12 @@ class NRGWindow(QMainWindow):
             ("available","RAM AVAILABLE"),("used","RAM IN USE"),("swap","SWAP IN USE"),
             ("cpu","CPU UTILIZATION"),("processes","PROCESSES"),("pressure","MEMORY PSI FULL"),
             ("disk","HOME VOLUME FREE"),("gpu","GPU MEMORY"),("network","NETWORK RX / TX"),
+            ("cpu_temp","CPU TEMPERATURE"),("gpu_usage","GPU UTILIZATION"),("gpu_temp","GPU TEMPERATURE"),
+            ("battery","BATTERY"),("wifi","WI-FI SIGNAL"),("disk_io","DISK READ / WRITE"),("fan","FAN SPEED"),
         ]):
             box, value = self._metric(title); self.metrics[key] = value
             self.metric_title_labels[key] = box.layout().itemAt(0).widget()
-            grid.addWidget(box, i//3, i%3)
+            grid.addWidget(box, i//4, i%4)
         layout.addLayout(grid)
         self.health = QLabel("Collecting resource signals…"); self.health.setObjectName("section")
         self.health.setWordWrap(True); layout.addWidget(self.health)
@@ -295,16 +389,22 @@ class NRGWindow(QMainWindow):
         self.search.textChanged.connect(self.populate_process_table)
         self.count_label = QLabel("—"); row.addWidget(self.search,1); row.addWidget(self.count_label)
         layout.addLayout(row)
-        self.process_table = QTableWidget(0,7)
-        self.process_table.setHorizontalHeaderLabels(["Process","PID","CPU %","RAM","Owner","I/O write","Review"])
+        self.process_table = QTableWidget(0,9)
+        self.process_table.setHorizontalHeaderLabels(["Process","PID","CPU %","RAM","Owner","I/O read","I/O write","State","Review"])
         self.process_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.process_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.process_table.setAlternatingRowColors(True); self.process_table.setSortingEnabled(True)
         self.process_table.horizontalHeader().setSectionResizeMode(0,QHeaderView.ResizeMode.Stretch)
-        for col in range(1,7): self.process_table.horizontalHeader().setSectionResizeMode(col,QHeaderView.ResizeMode.ResizeToContents)
+        for col in range(1,9): self.process_table.horizontalHeader().setSectionResizeMode(col,QHeaderView.ResizeMode.ResizeToContents)
         self.process_table.cellDoubleClicked.connect(self.open_process_details)
+        self.process_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.process_table.customContextMenuRequested.connect(self.process_context_menu)
+        self.process_actions_button = QPushButton("Manage selected process…")
+        self.process_actions_button.clicked.connect(self.show_process_actions)
+        action_row = QHBoxLayout(); action_row.addWidget(self.process_actions_button); action_row.addStretch()
+        layout.addLayout(action_row)
         layout.addWidget(self.process_table)
-        self.process_note = QLabel("CPU is normalized to one logical core (100% = one full core). RSS estimates can double-count shared pages.")
+        self.process_note = QLabel("CPU is normalized to one logical core. RSS may double-count shared pages. Network traffic is system-wide; per-process network accounting is not available in this collector yet.")
         self.process_note.setObjectName("muted"); layout.addWidget(self.process_note)
         self.tabs.addTab(page,"Processes")
 
@@ -317,8 +417,11 @@ class NRGWindow(QMainWindow):
         self.plan_button = QPushButton("Calculate memory plan"); self.plan_button.clicked.connect(self.run_plan)
         self.diag_button = QPushButton("Run system diagnosis"); self.diag_button.clicked.connect(self.run_diagnosis)
         self.edit_profiles_button = QPushButton("Edit coasters"); self.edit_profiles_button.clicked.connect(self.edit_profiles)
+        self.security_toggle = QCheckBox("Enable anomaly / security monitoring")
+        self.security_toggle.setChecked(True); self.security_toggle.toggled.connect(self.set_security_enabled)
         row.addWidget(self.profile_label); row.addWidget(self.profile)
-        row.addWidget(self.plan_button); row.addWidget(self.diag_button); row.addWidget(self.edit_profiles_button); row.addStretch()
+        row.addWidget(self.plan_button); row.addWidget(self.diag_button); row.addWidget(self.edit_profiles_button)
+        row.addWidget(self.security_toggle); row.addStretch()
         layout.addLayout(row)
         self.plan_note = QLabel("Adaptive memory plan · simulation only")
         layout.addWidget(self.plan_note)
@@ -339,6 +442,12 @@ class NRGWindow(QMainWindow):
         network_row.addWidget(self.upload_plan); network_row.addWidget(self.network_share_label); network_row.addWidget(self.primary_share)
         network_row.addWidget(self.network_preview_button); network_row.addStretch()
         layout.addLayout(network_row)
+        self.network_test_button = QPushButton("Run network speed test")
+        self.network_test_button.setToolTip("Uses speedtest-cli for download/upload/ping if installed; otherwise measures a 25 MB download only.")
+        self.network_test_button.clicked.connect(self.run_network_test)
+        layout.addWidget(self.network_test_button)
+        self.network_test_result = QLabel("No speed test yet. Test runs only when you click; fallback download uses up to 25 MB.")
+        self.network_test_result.setWordWrap(True); layout.addWidget(self.network_test_result)
         self.network_preview = QLabel("Network budget preview is advisory; no traffic shaping is applied.")
         self.network_preview.setWordWrap(True); layout.addWidget(self.network_preview)
         self.diag_output = QTextEdit(); self.diag_output.setReadOnly(True)
@@ -348,7 +457,7 @@ class NRGWindow(QMainWindow):
 
     def refresh(self):
         try:
-            procs, count, cpu_total, now = scan_processes()
+            procs, count, cpu_total, now = scan_processes(include_security=self.security_enabled)
             mem = read_meminfo()
             pm, pc, pi = (read_psi("/proc/pressure/"+name) for name in ("memory","cpu","io"))
             elapsed = max(.001, now-self.last_scan) if self.last_scan else REFRESH_MS/1000
@@ -364,7 +473,13 @@ class NRGWindow(QMainWindow):
             disk_stat = os.statvfs(Path.home())
             disk_total = disk_stat.f_blocks * disk_stat.f_frsize
             disk_free = disk_stat.f_bavail * disk_stat.f_frsize
+            sensors = read_ksystemstats()
             gpu = read_gpu_memory()
+            kde_gpu_used = sensors.get("gpu/all/usedVram")
+            kde_gpu_total = sensors.get("gpu/all/totalVram")
+            if gpu["kind"] != "dedicated" and kde_gpu_total and kde_gpu_total > 0:
+                gpu = {"name":"KDE GPU sensor", "used":int(kde_gpu_used or 0),
+                       "total":int(kde_gpu_total), "util":sensors.get("gpu/gpu0/usage"), "kind":"dedicated"}
             if gpu["kind"] == "dedicated":
                 gpu_text = f"{fmt_bytes(gpu['used'])} / {fmt_bytes(gpu['total'])}"
                 if gpu.get("util") is not None: gpu_text += f" · {gpu['util']}%"
@@ -385,16 +500,43 @@ class NRGWindow(QMainWindow):
                 ("swap",fmt_bytes(swap)),("cpu",f"{cpu_pct:.0f}%" if cpu_pct is not None else "—"),
                 ("processes",str(count)),("pressure",f"{pm.get('full',0):.2f}%"),
                 ("disk",fmt_bytes(disk_free)),("gpu",gpu_text),("network",network_text),
+                ("cpu_temp", f"{sensors['cpu/all/averageTemperature']:.0f} °C" if sensors.get("cpu/all/averageTemperature", 0) > 0 else "—"),
+                ("gpu_usage", f"{sensors['gpu/gpu0/usage']:.0f}%" if "gpu/gpu0/usage" in sensors else "—"),
+                ("gpu_temp", f"{sensors['gpu/gpu0/temperature']:.0f} °C" if sensors.get("gpu/gpu0/temperature", 0) > 0 else "—"),
+                ("battery", f"{sensors['power/123456789/charge']:.0f}%" if "power/123456789/charge" in sensors else self._sensor_value(sensors, "power/", "/charge", "%")),
+                ("wifi", self._sensor_value(sensors, "network/", "/signal", "%")),
+                ("disk_io", self._disk_io_text(sensors)),
+                ("fan", self._sensor_value(sensors, "lmsensors/", "/fan1", " RPM")),
             ]: self.metrics[key].setText(value)
             self.update_health(avail,total,cpu_pct,pm,pc,pi,disk_free,disk_total)
             self.live.setText("LIVE  ·  "+time.strftime("%H:%M:%S"))
         except Exception as exc:
             self.live.setText(f"Collection error: {exc}")
 
+    @staticmethod
+    def _sensor_value(sensors, prefix, suffix, unit):
+        match = next((value for key, value in sensors.items() if key.startswith(prefix) and key.endswith(suffix)), None)
+        return f"{match:.0f}{unit}" if match is not None and match > 0 else "—"
+
+    @staticmethod
+    def _disk_io_text(sensors):
+        if "disk/all/read" in sensors:
+            read_rate = sensors["disk/all/read"]
+        else:
+            read_rate = sum(v for k, v in sensors.items()
+                            if k.startswith("disk/nvme") and k.endswith("/read"))
+        if "disk/all/write" in sensors:
+            write_rate = sensors["disk/all/write"]
+        else:
+            write_rate = sum(v for k, v in sensors.items()
+                             if k.startswith("disk/nvme") and k.endswith("/write"))
+        if read_rate <= 0 and write_rate <= 0: return "—"
+        return f"{fmt_bytes(read_rate)}/s · {fmt_bytes(write_rate)}/s"
+
     def update_process_metrics(self, procs,count,cpu_total,old_cpu,elapsed):
         total_ticks = max(1,cpu_total[0]-old_cpu[0]) if cpu_total and old_cpu else max(1,int(elapsed*CLK_TCK*CPU_COUNT))
         current = {}
-        had_baseline = self.process_baseline_ready
+        had_baseline = self.process_baseline_ready and self.security_enabled
         new_children_by_parent = {}
         new_processes = 0
         if had_baseline:
@@ -403,7 +545,7 @@ class NRGWindow(QMainWindow):
                     new_processes += 1
                     parent = item["ppid"]
                     new_children_by_parent[parent] = new_children_by_parent.get(parent, 0) + 1
-        self.process_baseline_ready = True
+        self.process_baseline_ready = self.security_enabled
         self.new_processes_last = new_processes
         self.process_spawn_high = self.process_spawn_high + 1 if new_processes >= 40 else 0
         self.process_spawn_warning = self.process_spawn_high >= 2 or new_processes >= 120
@@ -419,23 +561,24 @@ class NRGWindow(QMainWindow):
                 cpu=max(0,(proc["ticks"]-old["ticks"])/total_ticks*CPU_COUNT*100)
                 read_rate=max(0,proc["read"]-old["read"])/elapsed
                 write_rate=max(0,proc["write"]-old["write"])/elapsed
-                cpu_high=old["cpu_high"]+1 if cpu>=80 else 0
-                growth_high=old["growth_high"]+1 if proc["rss"]-old["rss"]>=128*1024**2 else 0
-                write_high=old["write_high"]+1 if write_rate>=100*1024**2 else 0
+                cpu_high=(old["cpu_high"]+1 if cpu>=80 else 0) if self.security_enabled else 0
+                growth_high=(old["growth_high"]+1 if proc["rss"]-old["rss"]>=128*1024**2 else 0) if self.security_enabled else 0
+                write_high=(old["write_high"]+1 if write_rate>=100*1024**2 else 0) if self.security_enabled else 0
             else:
                 cpu_high=growth_high=write_high=0
             score,reasons=0,[]
-            if cpu_high>=3: score+=25; reasons.append("Sustained high CPU (>=80% of one core)")
-            if growth_high>=2: score+=25; reasons.append("Rapid resident-memory growth")
-            if write_high>=3: score+=15; reasons.append("Sustained high disk writes")
-            child_burst = new_children_by_parent.get(proc["pid"], 0)
-            if child_burst >= 12 or self.parent_spawn_high.get(proc["pid"], 0) >= 2:
-                score += 40
-                reasons.append(f"Rapid child-process fan-out ({child_burst} new direct children)")
-            exe=proc["exe"]
-            if exe.endswith(" (deleted)"): score+=35; reasons.append("Executable deleted while process is alive")
-            elif exe.startswith(("/tmp/","/var/tmp/","/dev/shm/")):
-                score+=15; reasons.append("Executable launched from a temporary directory")
+            if self.security_enabled:
+                if cpu_high>=3: score+=25; reasons.append("Sustained high CPU (>=80% of one core)")
+                if growth_high>=2: score+=25; reasons.append("Rapid resident-memory growth")
+                if write_high>=3: score+=15; reasons.append("Sustained high disk writes")
+                child_burst = new_children_by_parent.get(proc["pid"], 0)
+                if child_burst >= 12 or self.parent_spawn_high.get(proc["pid"], 0) >= 2:
+                    score += 40
+                    reasons.append(f"Rapid child-process fan-out ({child_burst} new direct children)")
+                exe=proc["exe"]
+                if exe.endswith(" (deleted)"): score+=35; reasons.append("Executable deleted while process is alive")
+                elif exe.startswith(("/tmp/","/var/tmp/","/dev/shm/")):
+                    score+=15; reasons.append("Executable launched from a temporary directory")
             proc.update(cpu=cpu,read_rate=read_rate,write_rate=write_rate,score=score,reasons=reasons)
             current[key]={"ticks":proc["ticks"],"read":proc["read"],"write":proc["write"],
                           "rss":proc["rss"],"cpu_high":cpu_high,"growth_high":growth_high,"write_high":write_high}
@@ -458,13 +601,157 @@ class NRGWindow(QMainWindow):
         self.process_table.setSortingEnabled(False); self.process_table.setRowCount(min(MAX_ROWS,len(rows)))
         for row,proc in enumerate(rows[:MAX_ROWS]):
             values=[proc["name"],proc["pid"],f"{proc['cpu']:.1f}",fmt_bytes(proc["rss"]),
-                    proc["owner"],fmt_bytes(proc["write_rate"])+"/s",
-                    f"{proc['score']} · Review" if proc["score"] else "—"]
+                    proc["owner"],fmt_bytes(proc["read_rate"])+"/s",fmt_bytes(proc["write_rate"])+"/s",
+                    proc["state"],f"{proc['score']} · Review" if proc["score"] else "—"]
             for col,value in enumerate(values):
-                obj=cell(value,Qt.AlignmentFlag.AlignRight|Qt.AlignmentFlag.AlignVCenter if col in (1,2,3,5,6) else None)
+                obj=cell(value,Qt.AlignmentFlag.AlignRight|Qt.AlignmentFlag.AlignVCenter if col in (1,2,3,5,6,8) else None)
                 obj.setData(Qt.ItemDataRole.UserRole,(proc["pid"],proc["start"]))
                 self.process_table.setItem(row,col,obj)
         self.process_table.setSortingEnabled(True)
+
+    def process_context_menu(self, position):
+        index = self.process_table.indexAt(position)
+        if index.isValid():
+            self.process_table.selectRow(index.row())
+        self.show_process_actions(self.process_table.viewport().mapToGlobal(position))
+
+    def show_process_actions(self, global_position=None):
+        proc = self.selected_process(self.process_table)
+        if not proc:
+            QMessageBox.information(self, "NRG", "Select a process first.")
+            return
+        menu = QMenu(self)
+        labels = [
+            ("Suspend (STOP)" if self.language == "en" else "Suspender (STOP)", signal.SIGSTOP),
+            ("Continue (CONT)" if self.language == "en" else "Continuar (CONT)", signal.SIGCONT),
+            ("Hangup (HUP)" if self.language == "en" else "Colgar (HUP)", signal.SIGHUP),
+            ("Interrupt (INT)" if self.language == "en" else "Interrumpir (INT)", signal.SIGINT),
+            ("Terminate (TERM)…" if self.language == "en" else "Terminar (TERM)…", signal.SIGTERM),
+            ("Kill (KILL)…" if self.language == "en" else "Matar (KILL)…", signal.SIGKILL),
+        ]
+        for label, sig in labels:
+            action = menu.addAction(label)
+            action.triggered.connect(lambda checked=False, p=proc, s=sig: self.send_process_signal(p, s))
+        menu.addSeparator()
+        priority = menu.addAction("Set priority / Ajustar prioridad…")
+        priority.triggered.connect(lambda: self.change_process_priority(proc))
+        affinity = menu.addAction("Set CPU affinity / Afinidad de CPU…")
+        affinity.triggered.connect(lambda: self.change_process_affinity(proc))
+        menu.addSeparator()
+        details = menu.addAction("Process details / Detalles del proceso…")
+        details.triggered.connect(lambda: ProcessDetails(proc, self, self.language).exec())
+        if global_position is None:
+            global_position = self.process_table.viewport().mapToGlobal(
+                self.process_table.visualItemRect(self.process_table.currentItem()).center()
+            ) if self.process_table.currentItem() else self.mapToGlobal(self.rect().center())
+        menu.exec(global_position)
+
+    def _protected_process(self, pid):
+        protected = {1, os.getpid()}
+        current = os.getpid()
+        for _ in range(32):
+            try:
+                raw = Path(f"/proc/{current}/stat").read_text()
+                close = raw.rfind(")")
+                parent = int(raw[close + 2:].split()[1])
+            except (OSError, ValueError, IndexError):
+                break
+            if parent <= 1 or parent in protected:
+                break
+            protected.add(parent); current = parent
+        return pid in protected
+
+    def _validate_process_identity(self, proc):
+        pid = int(proc["pid"])
+        if self._protected_process(pid):
+            raise PermissionError("NRG refuses to control PID 1 or one of its own ancestor processes.")
+        try:
+            raw = Path(f"/proc/{pid}/stat").read_text()
+            close = raw.rfind(")")
+            current_start = int(raw[close + 2:].split()[19])
+        except (OSError, ValueError, IndexError) as exc:
+            raise ProcessLookupError(f"Process {pid} no longer exists or cannot be inspected.") from exc
+        if current_start != int(proc["start"]):
+            raise ProcessLookupError("The PID was reused; the selected process identity changed. Refresh and select it again.")
+        return pid
+
+    def send_process_signal(self, proc, sig):
+        destructive = sig in (signal.SIGTERM, signal.SIGKILL)
+        if destructive:
+            name = "SIGKILL" if sig == signal.SIGKILL else "SIGTERM"
+            answer = QMessageBox.warning(
+                self, f"Confirm {name}",
+                f"Send {name} to {proc['name']} (PID {proc['pid']})? Unsaved work may be lost.",
+                QMessageBox.StandardButton.Cancel | QMessageBox.StandardButton.Yes,
+                QMessageBox.StandardButton.Cancel,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+        try:
+            pid = self._validate_process_identity(proc)
+            if hasattr(os, "pidfd_open") and hasattr(signal, "pidfd_send_signal"):
+                pidfd = os.pidfd_open(pid, 0)
+                try:
+                    self._validate_process_identity(proc)
+                    signal.pidfd_send_signal(pidfd, sig)
+                finally:
+                    os.close(pidfd)
+            else:
+                self._validate_process_identity(proc)
+                os.kill(pid, sig)
+            self.live.setText(f"Sent {signal.Signals(sig).name} to {proc['name']} ({pid})")
+        except (OSError, ValueError) as exc:
+            QMessageBox.warning(self, "Process action failed", str(exc))
+
+    def change_process_priority(self, proc):
+        try:
+            pid = self._validate_process_identity(proc)
+            current = os.getpriority(os.PRIO_PROCESS, pid)
+        except (OSError, ValueError) as exc:
+            QMessageBox.warning(self, "Priority unavailable", str(exc)); return
+        value, accepted = QInputDialog.getInt(
+            self, "Process priority / Prioridad del proceso",
+            "Nice value (-20 = highest, 19 = lowest):", current, -20, 19, 1,
+        )
+        if not accepted: return
+        try:
+            self._validate_process_identity(proc)
+            os.setpriority(os.PRIO_PROCESS, pid, value)
+            self.live.setText(f"Nice value for PID {pid}: {value}")
+        except (OSError, ValueError) as exc:
+            QMessageBox.warning(self, "Priority change failed", f"{exc}\nNon-root users generally cannot increase scheduling priority (lower nice value).")
+
+    def change_process_affinity(self, proc):
+        try:
+            pid = self._validate_process_identity(proc)
+            current = set(os.sched_getaffinity(pid))
+            allowed = sorted(os.sched_getaffinity(0))
+            if not current.issubset(set(allowed)):
+                allowed = sorted(current | set(allowed))
+        except (AttributeError, OSError, ValueError) as exc:
+            QMessageBox.warning(self, "CPU affinity unavailable", str(exc)); return
+        dialog = QDialog(self); dialog.setWindowTitle(f"CPU affinity · PID {pid}")
+        dialog_layout = QVBoxLayout(dialog)
+        dialog_layout.addWidget(QLabel("Select the logical CPUs this process may run on:"))
+        checks = []
+        grid = QGridLayout()
+        for index, cpu in enumerate(allowed):
+            check = QCheckBox(f"CPU {cpu}"); check.setChecked(cpu in current)
+            checks.append((cpu, check)); grid.addWidget(check, index // 6, index % 6)
+        dialog_layout.addLayout(grid)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Apply | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(dialog.accept); buttons.rejected.connect(dialog.reject)
+        dialog_layout.addWidget(buttons)
+        if dialog.exec() != QDialog.DialogCode.Accepted: return
+        selected = {cpu for cpu, check in checks if check.isChecked()}
+        if not selected:
+            QMessageBox.warning(self, "Invalid affinity", "At least one CPU must remain enabled."); return
+        try:
+            self._validate_process_identity(proc)
+            os.sched_setaffinity(pid, selected)
+            self.live.setText(f"CPU affinity for PID {pid}: {', '.join(map(str, sorted(selected)))}")
+        except (OSError, ValueError) as exc:
+            QMessageBox.warning(self, "Affinity change failed", str(exc))
 
     def update_health(self,avail,total,cpu,mem,cpu_psi,io_psi,disk_free,disk_total):
         ratio=avail/total if total else 1
@@ -560,6 +847,13 @@ class NRGWindow(QMainWindow):
             self.download_plan.setText(str(data.get("download_plan_mbps", "")))
             self.upload_plan.setText(str(data.get("upload_plan_mbps", "")))
             self.primary_share.setText(str(data.get("network_primary_share", 70)))
+            self.security_enabled = bool(data.get("security_enabled", True))
+            self.security_toggle.setChecked(self.security_enabled)
+            self.measured_down_mbps = data.get("measured_down_mbps")
+            self.measured_up_mbps = data.get("measured_up_mbps")
+            if self.measured_down_mbps and self.measured_up_mbps:
+                self.network_test_result.setText(
+                    f"Last measured: {float(self.measured_down_mbps):.1f} Mbps down / {float(self.measured_up_mbps):.1f} Mbps up")
         except (OSError, ValueError, TypeError, AttributeError):
             pass
 
@@ -581,6 +875,17 @@ class NRGWindow(QMainWindow):
     def save_profile(self, profile):
         if re.fullmatch(r"[a-z0-9_-]{1,32}", profile):
             self.save_desktop_config(active_profile=profile)
+
+    def set_security_enabled(self, enabled):
+        self.security_enabled = bool(enabled)
+        self.save_desktop_config(security_enabled=self.security_enabled)
+        self.process_spawn_high = 0
+        self.process_spawn_warning = False
+        self.parent_spawn_high.clear()
+        self.process_baseline_ready = False
+        if not self.security_enabled:
+            self.new_processes_last = 0
+        self.live.setText("Anomaly monitoring enabled" if enabled else "Anomaly monitoring disabled")
 
     def change_language(self, index):
         self.language = self.language_box.currentData() or "en"
@@ -605,6 +910,13 @@ class NRGWindow(QMainWindow):
             "disk": ("HOME VOLUME FREE", "ESPACIO LIBRE EN HOME"),
             "gpu": ("GPU MEMORY", "MEMORIA DE GPU"),
             "network": ("NETWORK RX / TX", "RED RX / TX"),
+            "cpu_temp": ("CPU TEMPERATURE", "TEMPERATURA CPU"),
+            "gpu_usage": ("GPU UTILIZATION", "USO DE GPU"),
+            "gpu_temp": ("GPU TEMPERATURE", "TEMPERATURA GPU"),
+            "battery": ("BATTERY", "BATERÍA"),
+            "wifi": ("WI-FI SIGNAL", "SEÑAL WI-FI"),
+            "disk_io": ("DISK READ / WRITE", "LECTURA / ESCRITURA DISCO"),
+            "fan": ("FAN SPEED", "VELOCIDAD DEL VENTILADOR"),
         }
         for key, label in self.metric_title_labels.items(): label.setText(tr(*titles[key]))
         self.alert_heading.setText(tr("Processes that deserve a closer look", "Procesos que requieren revisión"))
@@ -622,9 +934,28 @@ class NRGWindow(QMainWindow):
         self.plan_note.setText(tr("Adaptive memory plan · simulation only", "Plan adaptativo de memoria · solo simulación"))
         self.plan_table.setHorizontalHeaderLabels([tr("Application", "Aplicación"), tr("Priority", "Prioridad"), tr("Current", "Actual"), tr("Proposed soft ceiling", "Techo flexible propuesto"), tr("Samples", "Muestras")])
         self.diag_output.setPlaceholderText(tr("System diagnosis output appears here.", "El diagnóstico del sistema aparecerá aquí."))
+        self.process_actions_button.setText(tr("Manage selected process…", "Administrar proceso seleccionado…"))
+        self.security_toggle.setText(tr("Enable anomaly / security monitoring", "Activar monitoreo de anomalías / seguridad"))
+        self.security_toggle.setChecked(self.security_enabled)
+        self.process_table.setHorizontalHeaderLabels(
+            ["Process" if not es else "Proceso", "PID", "CPU %", "RAM", "Owner" if not es else "Usuario",
+             "I/O read" if not es else "Lectura E/S", "I/O write" if not es else "Escritura E/S",
+             "State" if not es else "Estado", "Review" if not es else "Revisar"])
+        self.process_note.setText(tr(
+            "CPU is normalized to one logical core. RSS may double-count shared pages. Network traffic is system-wide; per-process network accounting is not available in this collector yet.",
+            "CPU se normaliza por núcleo lógico. RSS puede contar páginas compartidas más de una vez. El tráfico de red es global; aún no se atribuye a cada proceso."))
         self.download_plan.setPlaceholderText(tr("Download Mbps", "Descarga Mbps"))
         self.upload_plan.setPlaceholderText(tr("Upload Mbps", "Subida Mbps"))
         self.network_preview_button.setText(tr("Preview network budget", "Simular presupuesto de red"))
+        self.network_test_button.setText(tr("Run network speed test", "Probar velocidad de red"))
+        if self.measured_down_mbps and self.measured_up_mbps:
+            self.network_test_result.setText(
+                f"Última prueba: {self.measured_down_mbps:.1f} Mbps descarga / {self.measured_up_mbps:.1f} Mbps subida"
+                if es else f"Last test: {self.measured_down_mbps:.1f} Mbps download / {self.measured_up_mbps:.1f} Mbps upload")
+        else:
+            self.network_test_result.setText(tr(
+                "No speed test yet. Click to run; fallback download uses up to 25 MB.",
+                "Sin prueba todavía. Pulsa para iniciar; la prueba alternativa usa hasta 25 MB de descarga."))
         self.network_preview.setText(tr("Network budget preview is advisory; no traffic shaping is applied.",
             "La simulación de red es orientativa; no aplica control de tráfico."))
         self.network_plan_label.setText(tr("Internet plan ↓ / ↑ Mbps", "Plan de Internet ↓ / ↑ Mbps"))
@@ -641,7 +972,11 @@ class NRGWindow(QMainWindow):
             QMessageBox.warning(self, "Invalid network plan", "Enter valid download/upload Mbps (1–100000) and a top-app share (1–100%).")
             return
         # Reserve 10% for protocol overhead and measurement variance.
-        usable_down, usable_up = down * 0.90, up * 0.90
+        effective_down = min(down, float(self.measured_down_mbps)) if self.measured_down_mbps else down
+        effective_up = min(up, float(self.measured_up_mbps)) if self.measured_up_mbps else up
+        down_source = "measured" if self.measured_down_mbps else "contracted plan"
+        up_source = "measured" if self.measured_up_mbps else "contracted plan"
+        usable_down, usable_up = effective_down * 0.90, effective_up * 0.90
         priority_down, priority_up = usable_down * share / 100, usable_up * share / 100
         rest_down, rest_up = usable_down - priority_down, usable_up - priority_up
         self.save_desktop_config(download_plan_mbps=down, upload_plan_mbps=up, network_primary_share=share)
@@ -656,12 +991,50 @@ class NRGWindow(QMainWindow):
             self.network_preview.setText(
                 f"Perfil {profile}: {top_app} recibiría como objetivo simulado {priority_down:.1f} Mbps ↓ / {priority_up:.1f} Mbps ↑. "
                 f"Resto de apps: {rest_down:.1f} Mbps ↓ / {rest_up:.1f} Mbps ↑. "
-                f"Capacidad utilizable estimada tras reservar 10%: {usable_down:.1f} / {usable_up:.1f} Mbps. SIMULACIÓN; no se aplican límites.")
+                f"Capacidad efectiva: {effective_down:.1f} Mbps descarga ({down_source}) / {effective_up:.1f} Mbps subida ({up_source}). "
+                f"Tras reservar 10%: {usable_down:.1f} / {usable_up:.1f} Mbps. SIMULACIÓN; no se aplican límites.")
         else:
             self.network_preview.setText(
                 f"Profile {profile}: {top_app} would receive a simulated target of {priority_down:.1f} Mbps down / {priority_up:.1f} Mbps up. "
                 f"Other apps: {rest_down:.1f} / {rest_up:.1f} Mbps. "
-                f"Estimated usable capacity after a 10% safety margin: {usable_down:.1f} / {usable_up:.1f} Mbps. SIMULATION; no limits applied.")
+                f"Effective capacity: {effective_down:.1f} Mbps down ({down_source}) / {effective_up:.1f} Mbps up ({up_source}). "
+                f"Usable after 10% safety margin: {usable_down:.1f} / {usable_up:.1f} Mbps. SIMULATION; no limits applied.")
+
+    def run_network_test(self):
+        if self.network_worker and self.network_worker.isRunning():
+            return
+        self.network_test_button.setEnabled(False)
+        self.network_test_result.setText(
+            "Probando descarga y subida; puede consumir hasta 33 MB…" if self.language == "es"
+            else "Testing download and upload; may use up to 33 MB…")
+        self.network_worker = NetworkTestWorker(self)
+        self.network_worker.completed.connect(self.network_test_finished)
+        self.network_worker.start()
+
+    def network_test_finished(self, result):
+        self.network_test_button.setEnabled(True)
+        if not result.get("ok"):
+            self.network_test_result.setText(
+                ("Falló la prueba: " if self.language == "es" else "Speed test failed: ") + result.get("error", "unknown error"))
+            return
+        self.measured_down_mbps = round(float(result["download_mbps"]), 2)
+        updates = {"measured_down_mbps": self.measured_down_mbps}
+        if result.get("upload_mbps") is not None:
+            self.measured_up_mbps = round(float(result["upload_mbps"]), 2)
+            updates["measured_up_mbps"] = self.measured_up_mbps
+        self.save_desktop_config(**updates)
+        if result.get("needs_upload_cli"):
+            self.network_test_result.setText(
+                (f"Descarga medida: {self.measured_down_mbps:.1f} Mbps. Para medir subida y latencia instala el paquete Arch speedtest-cli."
+                 if self.language == "es" else
+                 f"Measured download: {self.measured_down_mbps:.1f} Mbps. Install Arch's speedtest-cli package to measure upload and latency."))
+        else:
+            self.network_test_result.setText(
+                f"Última prueba: {self.measured_down_mbps:.1f} Mbps descarga / {self.measured_up_mbps:.1f} Mbps subida · {result.get('ping_ms', 0):.1f} ms ping · {result.get('server', '')}"
+                if self.language == "es" else
+                f"Last test: {self.measured_down_mbps:.1f} Mbps download / {self.measured_up_mbps:.1f} Mbps upload · {result.get('ping_ms', 0):.1f} ms ping · {result.get('server', '')}")
+        if self.download_plan.text().strip() and self.upload_plan.text().strip():
+            self.preview_network_budget()
 
     def edit_profiles(self):
         defaults = {

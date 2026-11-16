@@ -2,7 +2,7 @@
 Type=Application
 Name=NRG Desktop
 GenericName=Resource Governor
-Comment=Monitor resources and diagnose system slowdowns
+Comment=Monitor resources, manage processes, and diagnose system health
 Exec=@NRG_DESKTOP_SCRIPT@
 TryExec=/usr/bin/python3
 Path=@NRG_PROJECT_ROOT@
