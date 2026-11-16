@@ -163,3 +163,7 @@ License not selected yet.
 
 
 The Applications tab groups processes by cgroup v2 workload and reads memory.current per workload when available; double-clicking a group filters the process table. The History tab plots the last 360 monitor samples (about one hour at the default interval) for available RAM, swap, PSI, and the largest workload memory footprints.
+
+
+
+The desktop overview uses compact circular gauges for available RAM, CPU, GPU utilization, and swap, with secondary hardware metrics below. Application rows are limited to user application cgroups, resolve installed desktop names/icons, and merge sibling scopes/services belonging to the same app. The process review heuristic deliberately does not flag a deleted executable by itself: this state commonly follows a package/binary upgrade while the old process remains alive. The dashboard reports unavailable fan RPM honestly when firmware does not expose a readable sensor.

@@ -276,3 +276,7 @@ The Applications view groups the /proc inventory by its cgroup-v2 path and reads
 The process table supports per-PID STOP/CONT/HUP/INT/TERM/KILL signals, nice-value adjustment, and CPU affinity. TERM/KILL are confirmation-gated. Before any action, NRG re-reads /proc/PID/stat and verifies the kernel start-time value to guard against PID reuse; signals use pidfd_send_signal when supported so the signal is bound to the opened process identity. PID 1 and the NRG process's ancestor chain are protected. Operations remain subject to the logged-in user's Linux permissions. This is not a privileged helper and does not manage complete desktop application process groups yet.
 
 The desktop entry is installed under ~/.local/share/applications by packaging/install-desktop.sh. The application runs as the logged-in user, requires PySide6, and makes no cgroup, scheduler, kernel, process-control, network-shaping, or privilege changes. The background monitor continues when the UI closes.
+
+
+
+The desktop presentation keeps four primary circular gauges and a compact secondary metric grid. Application identity is resolved from systemd app cgroups and installed desktop entries; sibling cgroups for one app are aggregated for memory and process controls, with per-PID cgroup/start-time revalidation before signals. A deleted executable path is not considered suspicious on its own because in-place package upgrades routinely leave existing processes mapped to an unlinked old binary.

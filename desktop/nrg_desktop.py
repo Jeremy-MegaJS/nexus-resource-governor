@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """NRG Desktop: resource monitoring, guarded process management, and diagnostics."""
 from __future__ import annotations
-import json, os, pwd, re, signal, shlex, shutil, subprocess, sys, time, urllib.request
+import configparser, json, os, pwd, re, signal, shlex, shutil, subprocess, sys, time, urllib.request
 from pathlib import Path
 from PySide6.QtCore import Qt, QProcess, QTimer, QThread, Signal, QPointF
-from PySide6.QtGui import QFont, QColor, QPainter, QPen, QPolygonF
+from PySide6.QtGui import QFont, QColor, QPainter, QPen, QPolygonF, QIcon, QIcon
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QGridLayout,
     QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMenu, QMessageBox, QPushButton,
@@ -297,13 +297,14 @@ class HistoryChart(QWidget):
         if self.times:
             painter.drawText(int(left), self.height() - 7, self.times[0])
             painter.drawText(int(left + width - 90), self.height() - 7, self.times[-1])
-        legend_x = left + 12
-        for index, name in enumerate(self.series):
-            painter.setPen(QPen(QColor(self.PALETTE[index % len(self.PALETTE)]), 3))
-            painter.drawLine(int(legend_x), self.height() - 20, int(legend_x + 14), self.height() - 20)
-            painter.setPen(QColor("#c7c8cc"))
-            painter.drawText(int(legend_x + 19), self.height() - 16, name[:22])
-            legend_x += min(150, 35 + len(name) * 7)
+        if self.title.lower().startswith(("memory", "ram disponible")):
+            legend_x = left + 12
+            for index, name in enumerate(self.series):
+                painter.setPen(QPen(QColor(self.PALETTE[index % len(self.PALETTE)]), 3))
+                painter.drawLine(int(legend_x), self.height() - 20, int(legend_x + 14), self.height() - 20)
+                painter.setPen(QColor("#c7c8cc"))
+                painter.drawText(int(legend_x + 19), self.height() - 16, name[:22])
+                legend_x += min(150, 35 + len(name) * 7)
         painter.end()
 
 
@@ -378,11 +379,87 @@ class ProcessDetails(QDialog):
         buttons.rejected.connect(self.reject); layout.addWidget(buttons)
 
 
+class CircularGauge(QWidget):
+    def __init__(self, title, parent=None):
+        super().__init__(parent)
+        self.title = title
+        self.value_text = "—"
+        self.fraction = None
+        self.subtitle = ""
+        self.setMinimumSize(112, 112)
+        self.setSizePolicy(self.sizePolicy().Policy.Expanding, self.sizePolicy().Policy.Fixed)
+        self.setFixedHeight(148)
+
+    def set_metric(self, value_text, fraction=None, subtitle=""):
+        self.value_text = value_text
+        self.fraction = max(0.0, min(1.0, float(fraction))) if fraction is not None else None
+        self.subtitle = subtitle
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w, h = self.width(), self.height()
+        diameter = min(78, h - 46, w - 12)
+        diameter = max(48, diameter)
+        x, y = (w - diameter) / 2, 26
+        painter.setPen(QColor("#c8cbd2"))
+        painter.drawText(4, 17, w - 8, 18, Qt.AlignmentFlag.AlignHCenter, self.title)
+        painter.setPen(QPen(QColor("#30343b"), 7, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        painter.drawArc(int(x), int(y), int(diameter), int(diameter), 90 * 16, -360 * 16)
+        if self.fraction is not None:
+            painter.setPen(QPen(QColor("#48b8e8"), 7, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+            painter.drawArc(int(x), int(y), int(diameter), int(diameter), 90 * 16, int(-360 * self.fraction * 16))
+        painter.setPen(QColor("#f2f3f5"))
+        font = painter.font(); font.setBold(True); font.setPointSize(11); painter.setFont(font)
+        painter.drawText(int(x), int(y + diameter/2 - 12), int(diameter), 24, Qt.AlignmentFlag.AlignCenter, self.value_text)
+        painter.setPen(QColor("#9a9da6"))
+        font = painter.font(); font.setBold(False); font.setPointSize(8); painter.setFont(font)
+        painter.drawText(2, int(y + diameter + 18), w - 4, 18, Qt.AlignmentFlag.AlignHCenter, self.subtitle)
+        painter.end()
+
+
+class CircularGauge(QWidget):
+    def __init__(self, title, parent=None):
+        super().__init__(parent)
+        self.title, self.value_text, self.fraction, self.subtitle = title, "—", None, ""
+        self.setMinimumSize(112, 112)
+        self.setFixedHeight(148)
+
+    def set_metric(self, value_text, fraction=None, subtitle=""):
+        self.value_text = value_text
+        self.fraction = max(0.0, min(1.0, float(fraction))) if fraction is not None else None
+        self.subtitle = subtitle
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w, h = self.width(), self.height()
+        diameter = max(48, min(78, h - 46, w - 12))
+        x, y = (w - diameter) / 2, 26
+        painter.setPen(QColor("#c8cbd2"))
+        painter.drawText(4, 17, w - 8, 18, Qt.AlignmentFlag.AlignHCenter, self.title)
+        painter.setPen(QPen(QColor("#30343b"), 7, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        painter.drawArc(int(x), int(y), int(diameter), int(diameter), 90 * 16, -360 * 16)
+        if self.fraction is not None:
+            painter.setPen(QPen(QColor("#48b8e8"), 7, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+            painter.drawArc(int(x), int(y), int(diameter), int(diameter), 90 * 16, int(-360 * self.fraction * 16))
+        painter.setPen(QColor("#f2f3f5"))
+        font = painter.font(); font.setBold(True); font.setPointSize(11); painter.setFont(font)
+        painter.drawText(int(x), int(y + diameter/2 - 12), int(diameter), 24, Qt.AlignmentFlag.AlignCenter, self.value_text)
+        painter.setPen(QColor("#9a9da6"))
+        font = painter.font(); font.setBold(False); font.setPointSize(8); painter.setFont(font)
+        painter.drawText(2, int(y + diameter + 18), w - 4, 18, Qt.AlignmentFlag.AlignHCenter, self.subtitle)
+        painter.end()
+
+
 class NRGWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("NRG Desktop · Nexus Resource Governor")
-        self.resize(1180, 760)
+        self.resize(980, 700)
+        self.setMinimumSize(760, 540)
         self.previous, self.previous_cpu, self.last_scan = {}, None, None
         self.processes, self.process_rows = [], {}
         self.language = "en"
@@ -407,7 +484,9 @@ class NRGWindow(QMainWindow):
         self.setStyleSheet("""
             QMainWindow,QWidget{background:#101114;color:#e9e9eb}
             QTabWidget::pane{border:1px solid #303238;border-radius:8px}
-            QTabBar::tab{background:#1a1c21;padding:10px 18px;margin:3px;border-radius:6px}
+            QTabBar::tab{background:#1a1c21;padding:8px 12px;margin:2px;border-radius:6px}
+            QTabBar::tab:selected{background:#292c33;border-bottom:2px solid #d94b45}
+            QTabBar{qproperty-expanding:false}
             QTabBar::tab:selected{background:#292c33;border-bottom:2px solid #d94b45}
             QLabel#muted{color:#9a9da6}
             QLabel#metric{font-size:24px;font-weight:650;color:#f1f1f2}
@@ -428,17 +507,24 @@ class NRGWindow(QMainWindow):
         head.addWidget(brand); head.addWidget(self.subtitle); head.addStretch()
         head.addWidget(self.language_box); head.addWidget(self.live)
         root.addLayout(head)
-        self.tabs = QTabWidget(); root.addWidget(self.tabs)
+        self.tabs = QTabWidget()
+        self.tabs.setUsesScrollButtons(True)
+        root.addWidget(self.tabs)
         self._dashboard(); self._process_tab(); self._applications_tab(); self._history_tab(); self._diagnostics_tab()
         self.language_box.currentIndexChanged.connect(self.change_language)
         self.language = self.language_box.currentData() or "en"
-        self.setCentralWidget(central)
+        page_scroll = QScrollArea()
+        page_scroll.setWidgetResizable(True)
+        page_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        page_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        page_scroll.setWidget(central)
+        self.setCentralWidget(page_scroll)
         self.apply_language()
 
     def _metric(self, title):
         box, layout = QWidget(), QVBoxLayout()
         box.setLayout(layout); layout.setContentsMargins(12, 10, 12, 10)
-        name = QLabel(title); name.setObjectName("muted")
+        name = QLabel(title); name.setObjectName("muted"); name.setWordWrap(True)
         value = QLabel("—"); value.setObjectName("metric")
         layout.addWidget(name); layout.addWidget(value)
         box.setStyleSheet("background:#1a1c21;border:1px solid #303238;border-radius:8px")
@@ -447,34 +533,46 @@ class NRGWindow(QMainWindow):
     def _dashboard(self):
         page, layout = QWidget(), QVBoxLayout()
         page.setLayout(layout)
-        grid = QGridLayout(); self.metrics = {}
-        self.metric_title_labels = {}
-        for i, (key, title) in enumerate([
-            ("available","RAM AVAILABLE"),("used","RAM IN USE"),("swap","SWAP IN USE"),
-            ("cpu","CPU UTILIZATION"),("processes","PROCESSES"),("pressure","MEMORY PSI FULL"),
-            ("disk","HOME VOLUME FREE"),("gpu","GPU MEMORY"),("network","NETWORK RX / TX"),
-            ("cpu_temp","CPU TEMPERATURE"),("gpu_usage","GPU UTILIZATION"),("gpu_temp","GPU TEMPERATURE"),
-            ("battery","BATTERY"),("wifi","WI-FI SIGNAL"),("disk_io","DISK READ / WRITE"),("fan","FAN SPEED"),
+        self.metric_gauges = {}
+        gauge_grid = QGridLayout()
+        for col, (key, title) in enumerate([
+            ("available", "RAM AVAILABLE"), ("cpu", "CPU UTILIZATION"),
+            ("gpu_usage", "GPU UTILIZATION"), ("swap", "SWAP IN USE"),
         ]):
-            box, value = self._metric(title); self.metrics[key] = value
+            gauge = CircularGauge(title)
+            self.metric_gauges[key] = gauge
+            gauge_grid.addWidget(gauge, 0, col)
+        layout.addLayout(gauge_grid)
+        self.metrics, self.metric_title_labels = {}, {}
+        secondary = [
+            ("used","RAM IN USE"), ("processes","PROCESSES"), ("pressure","MEMORY PSI FULL"),
+            ("disk","HOME VOLUME FREE"), ("gpu","GPU MEMORY"), ("network","NETWORK RX / TX"),
+            ("cpu_temp","CPU TEMPERATURE"), ("gpu_temp","GPU TEMPERATURE"), ("battery","BATTERY"),
+            ("wifi","WI-FI SIGNAL"), ("disk_io","DISK READ / WRITE"), ("fan","FAN SPEED"),
+        ]
+        grid = QGridLayout()
+        for i, (key, title) in enumerate(secondary):
+            box, value = self._metric(title)
+            value.setStyleSheet("font-size:15px;font-weight:600;color:#f1f1f2")
+            self.metrics[key] = value
             self.metric_title_labels[key] = box.layout().itemAt(0).widget()
-            grid.addWidget(box, i//4, i%4)
+            box.layout().setContentsMargins(8, 5, 8, 5)
+            grid.addWidget(box, i // 4, i % 4)
         layout.addLayout(grid)
-        self.health = QLabel("Collecting resource signals…"); self.health.setObjectName("section")
-        self.health.setWordWrap(True); layout.addWidget(self.health)
-        self.alert_heading = QLabel("Processes that deserve a closer look")
-        layout.addWidget(self.alert_heading)
-        self.alert_table = QTableWidget(0,4)
-        self.alert_table.setHorizontalHeaderLabels(["Process","PID","Signal","Executable"])
+        self.health = QLabel("Collecting resource signals…")
+        self.health.setObjectName("section"); self.health.setWordWrap(True); layout.addWidget(self.health)
+        self.alert_heading = QLabel("Processes that deserve a closer look"); layout.addWidget(self.alert_heading)
+        self.alert_table = QTableWidget(0, 3)
+        self.alert_table.setHorizontalHeaderLabels(["Process", "PID", "Signal"])
         for col, mode in enumerate([QHeaderView.ResizeMode.ResizeToContents,
                                     QHeaderView.ResizeMode.ResizeToContents,
-                                    QHeaderView.ResizeMode.Stretch,QHeaderView.ResizeMode.Stretch]):
+                                    QHeaderView.ResizeMode.Stretch]):
             self.alert_table.horizontalHeader().setSectionResizeMode(col, mode)
         self.alert_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.alert_table.cellDoubleClicked.connect(self.open_alert_details)
-        layout.addWidget(self.alert_table, 1)
+        self.alert_table.setMaximumHeight(190); layout.addWidget(self.alert_table)
         self.dashboard_note = QLabel("System telemetry is read-only by default. Process controls require an explicit selection; no kernel or cgroup limits are changed.")
-        self.dashboard_note.setObjectName("muted"); layout.addWidget(self.dashboard_note)
+        self.dashboard_note.setObjectName("muted"); self.dashboard_note.setWordWrap(True); layout.addWidget(self.dashboard_note)
         self.tabs.addTab(page, "Overview")
 
     def _process_tab(self):
@@ -507,15 +605,15 @@ class NRGWindow(QMainWindow):
         page, layout = QWidget(), QVBoxLayout(); page.setLayout(layout)
         self.applications_heading = QLabel("Application workloads · grouped by cgroup v2")
         layout.addWidget(self.applications_heading)
-        self.applications_table = QTableWidget(0,7)
+        self.applications_table = QTableWidget(0,6)
         self.applications_table.setHorizontalHeaderLabels([
-            "Application / workload", "Processes", "CPU %", "Cgroup memory", "RSS sum", "Disk read / write", "Review"])
+            "Application", "Processes", "CPU %", "Memory", "Disk read / write", "Review"])
         self.applications_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.applications_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.applications_table.setAlternatingRowColors(True)
         self.applications_table.setSortingEnabled(True)
         self.applications_table.horizontalHeader().setSectionResizeMode(0,QHeaderView.ResizeMode.Stretch)
-        for col in range(1,7):
+        for col in range(1,6):
             self.applications_table.horizontalHeader().setSectionResizeMode(col,QHeaderView.ResizeMode.ResizeToContents)
         self.applications_table.cellDoubleClicked.connect(self.open_application_processes)
         self.applications_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
@@ -549,6 +647,13 @@ class NRGWindow(QMainWindow):
         }
         for chart in self.history_charts.values():
             charts_layout.addWidget(chart)
+        self.history_workload_table = QTableWidget(0, 2)
+        self.history_workload_table.setHorizontalHeaderLabels(["Application", "Memory"])
+        self.history_workload_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.history_workload_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self.history_workload_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.history_workload_table.setMaximumHeight(160)
+        charts_layout.addWidget(self.history_workload_table)
         charts_layout.addStretch()
         scroll.setWidget(content); layout.addWidget(scroll,1)
         self.history_note = QLabel("History comes from the independent NRG monitor service. The GUI does not need to remain open to collect it.")
@@ -647,14 +752,34 @@ class NRGWindow(QMainWindow):
                 ("swap",fmt_bytes(swap)),("cpu",f"{cpu_pct:.0f}%" if cpu_pct is not None else "—"),
                 ("processes",str(count)),("pressure",f"{pm.get('full',0):.2f}%"),
                 ("disk",fmt_bytes(disk_free)),("gpu",gpu_text),("network",network_text),
-                ("cpu_temp", f"{sensors['cpu/all/averageTemperature']:.0f} °C" if sensors.get("cpu/all/averageTemperature", 0) > 0 else "—"),
+                ("cpu_temp", f"{sensors.get('cpu/all/averageTemperature', sensors.get('cpu/all/maximumTemperature', 0)):.0f} °C" if sensors.get("cpu/all/averageTemperature", sensors.get("cpu/all/maximumTemperature", 0)) > 0 else "—"),
                 ("gpu_usage", f"{sensors['gpu/gpu0/usage']:.0f}%" if "gpu/gpu0/usage" in sensors else "—"),
                 ("gpu_temp", f"{sensors['gpu/gpu0/temperature']:.0f} °C" if sensors.get("gpu/gpu0/temperature", 0) > 0 else "—"),
                 ("battery", f"{sensors['power/123456789/charge']:.0f}%" if "power/123456789/charge" in sensors else self._sensor_value(sensors, "power/", "/charge", "%")),
                 ("wifi", self._sensor_value(sensors, "network/", "/signal", "%")),
                 ("disk_io", self._disk_io_text(sensors)),
-                ("fan", self._sensor_value(sensors, "lmsensors/", "/fan1", " RPM")),
-            ]: self.metrics[key].setText(value)
+                ("fan", self._sensor_value(sensors, "lmsensors/", "/fan1", " RPM")
+                 if any("/fan" in key for key in sensors) else
+                 ("No expuesto" if self.language == "es" else "Not exposed")),
+            ]:
+                if key in self.metrics:
+                    self.metrics[key].setText(value)
+            ram_fraction = (total - avail) / total if total else None
+            swap_total = mem.get("SwapTotal", 0)
+            swap_fraction = swap / swap_total if swap_total else None
+            gpu_fraction = (gpu["used"] / gpu["total"] if gpu.get("total") else
+                            (sensors.get("gpu/gpu0/usage", 0) / 100 if "gpu/gpu0/usage" in sensors else None))
+            self.metric_gauges["available"].title = "RAM DISPONIBLE" if self.language == "es" else "RAM AVAILABLE"
+            self.metric_gauges["available"].set_metric(
+                f"{avail/1024**3:.1f} GiB", ram_fraction, f"{(ram_fraction or 0)*100:.0f}% used")
+            self.metric_gauges["cpu"].set_metric(f"{cpu_pct:.0f}%" if cpu_pct is not None else "—",
+                cpu_pct / 100 if cpu_pct is not None else None, "total")
+            self.metric_gauges["gpu_usage"].set_metric(
+                f"{sensors['gpu/gpu0/usage']:.0f}%" if "gpu/gpu0/usage" in sensors else "—",
+                sensors.get("gpu/gpu0/usage", 0) / 100 if "gpu/gpu0/usage" in sensors else None,
+                gpu.get("name", "GPU"))
+            self.metric_gauges["swap"].set_metric(f"{swap/1024**3:.1f} GiB", swap_fraction,
+                f"{(swap_fraction or 0)*100:.0f}% used" if swap_total else "not configured")
             self.update_health(avail,total,cpu_pct,pm,pc,pi,disk_free,disk_total)
             self.live.setText("LIVE  ·  "+time.strftime("%H:%M:%S"))
         except Exception as exc:
@@ -723,7 +848,8 @@ class NRGWindow(QMainWindow):
                     score += 40
                     reasons.append(f"Rapid child-process fan-out ({child_burst} new direct children)")
                 exe=proc["exe"]
-                if exe.endswith(" (deleted)"): score+=35; reasons.append("Executable deleted while process is alive")
+                if exe.endswith(" (deleted)"):
+                    pass  # Common after package updates; not a security signal on its own.
                 elif exe.startswith(("/tmp/","/var/tmp/","/dev/shm/")):
                     score+=15; reasons.append("Executable launched from a temporary directory")
             proc.update(cpu=cpu,read_rate=read_rate,write_rate=write_rate,score=score,reasons=reasons)
@@ -735,7 +861,7 @@ class NRGWindow(QMainWindow):
         alerts=[p for p in procs if p["score"]>=25][:10]
         self.alert_table.setRowCount(len(alerts))
         for row,proc in enumerate(alerts):
-            for col,value in enumerate([proc["name"],proc["pid"],"; ".join(proc["reasons"]),proc["exe"] or "unavailable"]):
+            for col,value in enumerate([proc["name"],proc["pid"],"; ".join(proc["reasons"])]):
                 self.alert_table.setItem(row,col,cell(value))
         self.count_label.setText(f"{count} processes observed · showing up to {MAX_ROWS}")
         self.populate_process_table()
@@ -758,15 +884,61 @@ class NRGWindow(QMainWindow):
         self.populate_applications_table()
 
     @staticmethod
+    def _resolve_app_icon(icon_name):
+        if not icon_name:
+            return QIcon()
+        icon = QIcon.fromTheme(icon_name)
+        if not icon.isNull():
+            return icon
+        candidates = []
+        name = Path(icon_name)
+        if name.is_absolute():
+            candidates.append(name)
+        else:
+            for root in (Path("/usr/share/pixmaps"), Path.home() / ".local/share/pixmaps",
+                         Path("/usr/share/icons/hicolor"), Path.home() / ".local/share/icons/hicolor",
+                         Path("/usr/share/icons/breeze"), Path("/usr/share/icons/breeze-dark")):
+                if root.exists():
+                    candidates.extend(root.glob(f"**/apps/{icon_name}.*"))
+                    candidates.extend(root.glob(f"**/{icon_name}.*"))
+        for path in candidates:
+            if path.is_file() and path.suffix.lower() in (".png", ".svg", ".xpm"):
+                return QIcon(str(path))
+        return QIcon.fromTheme("applications-internet") if icon_name == "chromium" else QIcon()
+
+    @staticmethod
+    def _desktop_app_index():
+        index = {}
+        roots = [Path("/usr/share/applications"), Path.home() / ".local/share/applications",
+                 Path("/var/lib/flatpak/exports/share/applications"),
+                 Path.home() / ".local/share/flatpak/exports/share/applications"]
+        for root in roots:
+            if not root.is_dir():
+                continue
+            for path in root.glob("*.desktop"):
+                try:
+                    parser = configparser.ConfigParser(interpolation=None, strict=False)
+                    parser.read(path, encoding="utf-8")
+                    section = parser["Desktop Entry"]
+                    if section.get("NoDisplay", "false").lower() == "true":
+                        continue
+                    record = {"name": section.get("Name", path.stem),
+                              "icon": NRGWindow._resolve_app_icon(section.get("Icon", ""))}
+                    index[path.stem.casefold()] = record
+                    index.setdefault(record["name"].casefold(), record)
+                except (OSError, KeyError, configparser.Error):
+                    continue
+        return index
+
+    @staticmethod
     def _application_label(cgroup, fallback):
         leaf = cgroup.rstrip("/").rsplit("/", 1)[-1] if cgroup else fallback
+        leaf = re.sub(r"\\x([0-9a-fA-F]{2})", lambda match: chr(int(match.group(1), 16)), leaf)
         leaf = re.sub(r"^app-", "", leaf)
         leaf = re.sub(r"@[0-9a-f]{12,}(?=\.service$)", "", leaf, flags=re.I)
         leaf = re.sub(r"-[0-9]+(?=\.scope$)", "", leaf)
         leaf = re.sub(r"\.(scope|service)$", "", leaf)
         leaf = leaf.removeprefix("flatpak-")
-        if leaf.startswith("org.") and "." in leaf:
-            leaf = leaf.rsplit(".", 1)[-1]
         return leaf.replace("-", " ").strip() or fallback
 
     def populate_applications_table(self):
@@ -775,9 +947,22 @@ class NRGWindow(QMainWindow):
         groups = {}
         for proc in self.processes:
             cgroup = proc.get("cgroup", "")
-            key = cgroup or f"ungrouped/{proc['name']}"
-            item = groups.setdefault(key, {"cgroup": cgroup, "name": self._application_label(cgroup, proc["name"]),
-                "pids": [], "cpu": 0.0, "rss": 0, "read": 0.0, "write": 0.0, "score": 0})
+            leaf = cgroup.rstrip("/").rsplit("/", 1)[-1] if cgroup else ""
+            if not leaf.startswith("app-"):
+                continue
+            if any(token in leaf.casefold() for token in ("autostart", "notifier")):
+                continue
+            app_id = re.sub(r"\\x([0-9a-fA-F]{2})", lambda match: chr(int(match.group(1), 16)), leaf)
+            app_id = re.sub(r"^app-", "", app_id)
+            app_id = re.sub(r"@[0-9a-f]{12,}(?=\.service$)", "", app_id, flags=re.I)
+            app_id = re.sub(r"-[0-9]+(?=\.scope$)", "", app_id)
+            app_id = re.sub(r"\.(scope|service)$", "", app_id)
+            app_id = app_id.removeprefix("flatpak-")
+            key = app_id.casefold()
+            item = groups.setdefault(key, {"cgroup": cgroup, "cgroups": set(), "filter": app_id,
+                "name": self._application_label(cgroup, proc["name"]), "pids": [],
+                "cpu": 0.0, "rss": 0, "read": 0.0, "write": 0.0, "score": 0})
+            item["cgroups"].add(cgroup)
             item["pids"].append(proc["pid"])
             item["cpu"] += proc["cpu"]
             item["rss"] += proc["rss"]
@@ -786,31 +971,61 @@ class NRGWindow(QMainWindow):
             item["score"] = max(item["score"], proc["score"])
         ordered = sorted(groups.values(), key=lambda item: (item["score"], item["rss"]), reverse=True)
         self.application_groups = {key: item for key, item in groups.items()}
+        if not hasattr(self, "desktop_app_index"):
+            self.desktop_app_index = self._desktop_app_index()
         self.applications_table.setSortingEnabled(False)
         self.applications_table.setRowCount(len(ordered))
         for row, item in enumerate(ordered):
-            cgroup_memory = None
-            if item["cgroup"] and ".." not in Path(item["cgroup"]).parts:
+            cgroup_values = []
+            for workload_cgroup in item["cgroups"]:
+                if ".." in Path(workload_cgroup).parts:
+                    continue
                 try:
-                    cgroup_memory = int((Path("/sys/fs/cgroup") / item["cgroup"].lstrip("/") / "memory.current").read_text())
+                    cgroup_values.append(int((Path("/sys/fs/cgroup") / workload_cgroup.lstrip("/") / "memory.current").read_text()))
                 except (OSError, ValueError):
-                    pass
-            values = [item["name"], len(item["pids"]), f"{item['cpu']:.1f}",
-                fmt_bytes(cgroup_memory) if cgroup_memory is not None else "—",
-                fmt_bytes(item["rss"]), f"{fmt_bytes(item['read'])}/s · {fmt_bytes(item['write'])}/s",
+                    continue
+            cgroup_memory = sum(cgroup_values) if cgroup_values else None
+            app_id = item["filter"]
+            desktop_aliases = {"org.chromium.Chromium": "chromium"}
+            original_app_id = app_id
+            app_id = desktop_aliases.get(app_id, app_id)
+            metadata = self.desktop_app_index.get((app_id + ".desktop").casefold())
+            if metadata is None:
+                metadata = self.desktop_app_index.get(item["name"].casefold())
+            if original_app_id == "org.chromium.Chromium":
+                metadata = {"name": "Chromium", "icon": self._resolve_app_icon("internet-web-browser")}
+            if metadata is None and item["name"].casefold() == "remote desktop commander":
+                metadata = {"name": "Remote Desktop Commander", "icon": self._resolve_app_icon("utilities-terminal")}
+            if metadata is None and item["name"].casefold() == "alacritty":
+                metadata = {"name": "Alacritty", "icon": self._resolve_app_icon("utilities-terminal")}
+            display_name = metadata["name"] if metadata else item["name"]
+            memory_value = fmt_bytes(cgroup_memory) if cgroup_memory is not None else fmt_bytes(item["rss"]) + " RSS"
+            values = [display_name, len(item["pids"]), f"{item['cpu']:.1f}",
+                memory_value, f"{fmt_bytes(item['read'])}/s · {fmt_bytes(item['write'])}/s",
                 f"{item['score']} · Review" if item["score"] else "—"]
             for col, value in enumerate(values):
-                obj = cell(value, Qt.AlignmentFlag.AlignRight|Qt.AlignmentFlag.AlignVCenter if col in (1,2,3,4,6) else None)
-                obj.setData(Qt.ItemDataRole.UserRole, item["cgroup"])
+                obj = cell(value, Qt.AlignmentFlag.AlignRight|Qt.AlignmentFlag.AlignVCenter if col in (1,2,3,5) else None)
+                obj.setData(Qt.ItemDataRole.UserRole, key)
                 self.applications_table.setItem(row,col,obj)
+            name_item = self.applications_table.item(row, 0)
+            if name_item and metadata and not metadata["icon"].isNull():
+                name_item.setIcon(metadata["icon"])
+            elif name_item:
+                name_item.setIcon(self._resolve_app_icon("application-x-executable"))
+            if name_item:
+                name_item.setToolTip(" · ".join(sorted(item["cgroups"])))
+            memory_item = self.applications_table.item(row, 3)
+            if memory_item and cgroup_memory is None:
+                memory_item.setToolTip("RSS is an estimate and may count shared pages more than once.")
         self.applications_table.setSortingEnabled(True)
 
     def open_application_processes(self, row, col):
         item = self.applications_table.item(row, 0)
-        cgroup = item.data(Qt.ItemDataRole.UserRole) if item else ""
-        if not cgroup:
+        app_key = item.data(Qt.ItemDataRole.UserRole) if item else ""
+        if not app_key:
             return
-        self.search.setText(cgroup)
+        group = self.application_groups.get(app_key)
+        self.search.setText(group["filter"] if group else app_key)
         self.tabs.setCurrentWidget(self.process_table.parentWidget())
 
     def refresh_history(self):
@@ -835,13 +1050,18 @@ class NRGWindow(QMainWindow):
             latest, key=lambda item: item.get("memory_current_bytes") or 0, reverse=True)[:4]]
         workloads = {}
         for name in top_names:
-            workloads[name.split("@", 1)[0][:22]] = [
+            workloads[self._application_label("/" + name, name)[:22]] = [
                 next((w.get("memory_current_bytes", 0) / 1024**2 for w in item.get("workloads", []) if w.get("name") == name), 0)
                 for item in samples
             ]
         self.history_charts["memory"].set_data(memory, times)
         self.history_charts["pressure"].set_data(pressure, times)
         self.history_charts["workloads"].set_data(workloads, times)
+        self.history_workload_table.setRowCount(len(top_names))
+        for row, name in enumerate(top_names):
+            latest_value = next((w.get("memory_current_bytes", 0) for w in latest if w.get("name") == name), 0)
+            self.history_workload_table.setItem(row, 0, cell(name.split("@", 1)[0]))
+            self.history_workload_table.setItem(row, 1, cell(fmt_bytes(latest_value)))
         first = time.strftime("%H:%M", time.localtime(samples[0]["timestamp_unix_ms"] / 1000))
         last = time.strftime("%H:%M", time.localtime(samples[-1]["timestamp_unix_ms"] / 1000))
         self.history_status.setText(
@@ -903,13 +1123,14 @@ class NRGWindow(QMainWindow):
                 continue
             pidfd = None
             try:
-                self._validate_process_identity(proc, expected_cgroup=cgroup)
+                expected_cgroup = proc.get("cgroup", "")
+                self._validate_process_identity(proc, expected_cgroup=expected_cgroup)
                 if hasattr(os, "pidfd_open") and hasattr(signal, "pidfd_send_signal"):
                     pidfd = os.pidfd_open(pid, 0)
-                    self._validate_process_identity(proc, expected_cgroup=cgroup)
+                    self._validate_process_identity(proc, expected_cgroup=expected_cgroup)
                     signal.pidfd_send_signal(pidfd, sig)
                 else:
-                    self._validate_process_identity(proc, expected_cgroup=cgroup)
+                    self._validate_process_identity(proc, expected_cgroup=expected_cgroup)
                     os.kill(pid, sig)
                 sent += 1
             except (OSError, ValueError, ProcessLookupError, PermissionError):
@@ -1138,7 +1359,7 @@ class NRGWindow(QMainWindow):
         return self.config_dir() / "profiles.json"
 
     def reload_profiles(self):
-        names = ["balanced", "gaming", "study", "development"]
+        names = ["balanced", "gaming", "work", "study", "development"]
         try:
             data = json.loads(self.profiles_path().read_text())
             profiles = data.get("profiles", {})
@@ -1219,7 +1440,9 @@ class NRGWindow(QMainWindow):
         self.subtitle.setText(tr("Nexus Resource Governor  /  local diagnostics", "Nexus Resource Governor  /  diagnóstico local"))
         self.tabs.setTabText(0, tr("Overview", "Resumen"))
         self.tabs.setTabText(1, tr("Processes", "Procesos"))
-        self.tabs.setTabText(2, tr("Diagnosis & Profiles", "Diagnóstico y perfiles"))
+        self.tabs.setTabText(2, tr("Applications", "Aplicaciones"))
+        self.tabs.setTabText(3, tr("History", "Historial"))
+        self.tabs.setTabText(4, tr("Diagnosis & Profiles", "Diagnóstico y perfiles"))
         titles = {
             "available": ("RAM AVAILABLE", "RAM DISPONIBLE"),
             "used": ("RAM IN USE", "RAM EN USO"),
@@ -1239,6 +1462,16 @@ class NRGWindow(QMainWindow):
             "fan": ("FAN SPEED", "VELOCIDAD DEL VENTILADOR"),
         }
         for key, label in self.metric_title_labels.items(): label.setText(tr(*titles[key]))
+        self.metric_gauges["available"].title = tr("RAM AVAILABLE", "RAM DISPONIBLE")
+        self.metric_gauges["cpu"].title = tr("CPU UTILIZATION", "USO DE CPU")
+        self.metric_gauges["gpu_usage"].title = tr("GPU UTILIZATION", "USO DE GPU")
+        self.metric_gauges["swap"].title = tr("SWAP IN USE", "SWAP EN USO")
+        for gauge in self.metric_gauges.values(): gauge.update()
+        self.metric_gauges["available"].title = tr("RAM AVAILABLE", "RAM DISPONIBLE")
+        self.metric_gauges["cpu"].title = tr("CPU UTILIZATION", "USO DE CPU")
+        self.metric_gauges["gpu_usage"].title = tr("GPU UTILIZATION", "USO DE GPU")
+        self.metric_gauges["swap"].title = tr("SWAP IN USE", "SWAP EN USO")
+        for gauge in self.metric_gauges.values(): gauge.update()
         self.alert_heading.setText(tr("Processes that deserve a closer look", "Procesos que requieren revisión"))
         self.dashboard_note.setText(tr(
             "System telemetry is read-only by default. Process controls require an explicit selection; no kernel or cgroup limits are changed.",
@@ -1259,6 +1492,8 @@ class NRGWindow(QMainWindow):
         self.tabs.setTabText(4, tr("Diagnosis & Profiles", "Diagnóstico y perfiles"))
         self.history_heading.setText(tr("Resource history · last 60 minutes", "Historial de recursos · últimos 60 minutos"))
         self.history_refresh_button.setText(tr("Refresh history", "Actualizar historial"))
+        self.history_workload_table.setHorizontalHeaderLabels([tr("Application", "Aplicación"), tr("Memory", "Memoria")])
+        self.history_workload_table.setHorizontalHeaderLabels([tr("Application", "Aplicación"), tr("Memory", "Memoria")])
         self.history_note.setText(tr(
             "History comes from the independent NRG monitor service. The GUI does not need to remain open to collect it.",
             "El historial lo genera el servicio independiente de NRG. La interfaz no necesita permanecer abierta para recopilar datos."))
@@ -1268,13 +1503,13 @@ class NRGWindow(QMainWindow):
         for chart in self.history_charts.values(): chart.update()
         self.applications_heading.setText(tr("Application workloads · grouped by cgroup v2", "Aplicaciones · agrupadas por cgroup v2"))
         self.applications_table.setHorizontalHeaderLabels([
-            tr("Application / workload", "Aplicación / carga"), tr("Processes", "Procesos"), "CPU %",
-            tr("Cgroup memory", "Memoria cgroup"), "RSS sum", tr("Disk read / write", "Lectura / escritura"),
+            tr("Application", "Aplicación"), tr("Processes", "Procesos"), "CPU %",
+            tr("Memory", "Memoria"), tr("Disk read / write", "Lectura / escritura"),
             tr("Review", "Revisar")])
         self.application_actions_button.setText(tr("Manage selected workload…", "Administrar carga seleccionada…"))
         self.applications_note.setText(tr(
-            "Cgroup memory is the preferred per-workload total. RSS sum can double-count shared pages. Double-click a workload to inspect its processes. Network traffic is not yet attributed per application.",
-            "La memoria cgroup es la medida preferida por carga. La suma RSS puede contar páginas compartidas varias veces. Doble clic para inspeccionar procesos. La red aún no se atribuye por aplicación."))
+            "Memory uses cgroup totals when available; RSS is shown as an estimate otherwise. Double-click a workload to inspect its processes. Group controls affect only the listed application processes.",
+            "La memoria usa el total cgroup cuando está disponible; de lo contrario muestra RSS estimada. Doble clic para inspeccionar procesos. Los controles afectan solo a los procesos de la aplicación listada."))
         self.security_toggle.setText(tr("Enable anomaly / security monitoring", "Activar monitoreo de anomalías / seguridad"))
         self.security_toggle.setChecked(self.security_enabled)
         self.process_table.setHorizontalHeaderLabels(
@@ -1380,6 +1615,7 @@ class NRGWindow(QMainWindow):
         defaults = {
             "profiles": {
                 "gaming": {"priorities": ["geforcenow", "geometry", "steam", "gamescope"]},
+                "work": {"priorities": ["chatgpt", "wordcraft", "libreoffice", "onlyoffice", "firefox", "chromium", "spotify"]},
                 "study": {"priorities": ["wordcraft", "libreoffice", "onlyoffice", "chatgpt", "firefox", "chromium"]},
                 "development": {"priorities": ["codium", "code", "jetbrains", "terminal", "codex", "agy"]},
                 "balanced": {"priorities": ["chatgpt", "wordcraft", "geforcenow", "geometry", "firefox", "chromium"]}

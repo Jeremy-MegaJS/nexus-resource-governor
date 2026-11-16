@@ -224,7 +224,8 @@ fn normalize_profile(profile: &str) -> String {
     let normalized = profile.trim().to_ascii_lowercase();
     match normalized.as_str() {
         "gaming" | "game" => "gaming".to_owned(),
-        "study" | "school" | "work" => "study".to_owned(),
+        "study" | "school" => "study".to_owned(),
+        "work" => "work".to_owned(),
         "development" | "dev" | "coding" => "development".to_owned(),
         "balanced" => "balanced".to_owned(),
         _ if !normalized.is_empty()
@@ -291,6 +292,16 @@ fn priority_for(profile: &str, key: &str, custom: Option<&[String]>) -> (u8, &'s
             "firefox",
             "chromium",
             "brave",
+        ],
+        "work" => &[
+            "chatgpt",
+            "wordcraft",
+            "libreoffice",
+            "onlyoffice",
+            "firefox",
+            "chromium",
+            "brave",
+            "spotify",
         ],
         "development" => &[
             "codium",
@@ -452,6 +463,16 @@ mod tests {
         assert!(
             priority_for("study", "chatgpt", None).0 < priority_for("gaming", "chatgpt", None).0
         );
+    }
+
+    #[test]
+    fn work_profile_prioritizes_productivity_apps_over_browser_extras() {
+        let (chatgpt_rank, _) = priority_for("work", "chatgpt", None);
+        let (libreoffice_rank, _) = priority_for("work", "libreoffice", None);
+        let (firefox_rank, _) = priority_for("work", "firefox", None);
+        let (spotify_rank, _) = priority_for("work", "spotify", None);
+        assert!(chatgpt_rank < firefox_rank);
+        assert!(libreoffice_rank < spotify_rank);
     }
 
     #[test]

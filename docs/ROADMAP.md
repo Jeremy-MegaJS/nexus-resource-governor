@@ -86,6 +86,10 @@ The project currently has a read-only Linux telemetry backend and a policy/Rescu
 - [x] Add a user toggle to disable anomaly heuristics and executable-path inspection while retaining the process manager.
 - [x] Add an Applications view grouped by cgroup v2 workload with cgroup memory.current and process drill-down.
 - [x] Add a History view for RAM, swap, PSI pressure, and top workload memory using the monitor's bounded telemetry.
+- [x] Improve dashboard hierarchy with circular primary gauges, compact secondary metrics, and responsive scrolling.
+- [x] Resolve app names/icons from desktop entries, aggregate sibling cgroups, and filter system/autostart noise from the Applications view.
+- [x] Replace the false-positive deleted-executable alert with no signal unless supported by other evidence.
+- [x] Add an explicit Work profile alongside Gaming in the dry-run planner.
 - [ ] Add system tray integration and configurable refresh/telemetry cost modes.
 - [ ] Add persistent workload identity and editable per-app memory floors/ceilings.
 - [x] Add confirmation-gated STOP/CONT/TERM/KILL actions for the currently observed PIDs in a selected cgroup workload.
