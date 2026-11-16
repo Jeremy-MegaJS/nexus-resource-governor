@@ -67,6 +67,18 @@ pub(crate) struct GraphicsDevice {
     pub(crate) boot_vga: Option<bool>,
 }
 
+#[derive(Debug)]
+struct KScreenOutput {
+    name: String,
+    connected: bool,
+    enabled: bool,
+    mode: String,
+    width: u64,
+    height: u64,
+    x: i64,
+    y: i64,
+}
+
 #[derive(Debug, Serialize)]
 pub(crate) struct DisplayConnector {
     pub(crate) name: String,
@@ -437,8 +449,52 @@ impl Snapshot {
             out.push_str("  IRQ 27: no matching /proc/interrupts row was available.\n");
         }
         out.push_str("  GRAPHICS: driver identity is reported where sysfs exposes it; this build does not yet measure GPU engine hangs or resets.\n");
+        match read_kscreen_outputs() {
+            Ok(outputs) if !outputs.is_empty() => {
+                out.push_str("KScreen runtime outputs (userspace state):\n");
+                for output in &outputs {
+                    out.push_str(&format!(
+                        "  {} connected={} enabled={} mode={} geometry={}x{} at {},{}\n",
+                        output.name,
+                        output.connected,
+                        output.enabled,
+                        output.mode,
+                        output.width,
+                        output.height,
+                        output.x,
+                        output.y
+                    ));
+                }
+                let drm_connected = self
+                    .display_connectors
+                    .iter()
+                    .any(|connector| connector.status.as_deref() == Some("connected"));
+                let kscreen_connected = outputs.iter().any(|output| output.connected);
+                if drm_connected && !kscreen_connected {
+                    out.push_str("DISPLAY MISMATCH: sysfs/DRM reports a connected connector, but KScreen reports none.\n");
+                } else if !drm_connected && kscreen_connected {
+                    out.push_str("DISPLAY MISMATCH: KScreen reports a connected output, but sysfs/DRM reports none.\n");
+                }
+            }
+            Ok(_) => {
+                out.push_str("KScreen reports no outputs in its current userspace state.\n");
+                if self
+                    .display_connectors
+                    .iter()
+                    .any(|connector| connector.status.as_deref() == Some("connected"))
+                {
+                    out.push_str("DISPLAY MISMATCH: sysfs/DRM sees a connected connector while KScreen reports zero outputs.\n");
+                }
+            }
+            Err(error) => out.push_str(&format!("KScreen runtime state unavailable: {error}\n")),
+        }
+        match read_kscreen_dpms() {
+            Ok(state) => out.push_str(&format!("KScreen DPMS: {state}\n")),
+            Err(error) => out.push_str(&format!("KScreen DPMS state unavailable: {error}\n")),
+        }
         let mut desktop_reported_no_outputs = false;
         let mut swapchain_allocation_failures = false;
+        let mut atomic_commit_failures = false;
         for (label, boot) in [
             ("current boot", "0"),
             ("previous boot", "-1"),
@@ -472,6 +528,7 @@ impl Snapshot {
                             || lower.contains("unexisting screen");
                         swapchain_allocation_failures |=
                             lower.contains("failed to allocate a graphics buffer for a swapchain");
+                        atomic_commit_failures |= lower.contains("atomic commit failed");
                     }
                     out.push_str(&format!("\nRelevant desktop/graphics session events ({label}; filtered and bounded):\n"));
                     for event in events {
@@ -493,6 +550,9 @@ impl Snapshot {
         }
         if swapchain_allocation_failures {
             out.push_str("GRAPHICS WARNING: KWin reported swapchain buffer allocation failures in the retained session journal. This can disrupt presentation but does not alone prove a full-system freeze.\n");
+        }
+        if atomic_commit_failures {
+            out.push_str("DISPLAY WARNING: KWin reported a DRM atomic-commit failure in the retained session journal. Correlate it with connector hotplug/output-loss events.\n");
         }
         out.push_str("\nCORRELATION: capture JSONL during the next freeze and record its local timestamp; a single snapshot cannot identify the cause.\n");
         out
@@ -713,42 +773,174 @@ fn is_relevant_graphics_event(line: &str) -> bool {
 
 fn parse_graphics_events(input: &str, max_events: usize) -> Vec<String> {
     let mut seen = std::collections::BTreeSet::new();
-    let mut events: Vec<String> = input
-        .lines()
-        .filter(|line| is_relevant_graphics_event(line))
-        .filter(|line| seen.insert(journal_message_signature(line).to_owned()))
-        .map(|line| line.chars().take(420).collect())
-        .collect();
-    if events.len() > max_events {
-        events = events.split_off(events.len() - max_events);
+    let mut critical = Vec::new();
+    let mut routine = Vec::new();
+    for (index, line) in input.lines().enumerate() {
+        if !is_relevant_graphics_event(line)
+            || !seen.insert(journal_message_signature(line).to_owned())
+        {
+            continue;
+        }
+        let lower = line.to_ascii_lowercase();
+        let is_critical = [
+            "atomic commit failed",
+            "failed to allocate a graphics buffer",
+            "swapchain",
+            "no outputs",
+            "placeholder screen",
+            "unexisting screen",
+            "gpu reset",
+            "main thread was hanging",
+            "segfault",
+            "core dumped",
+        ]
+        .iter()
+        .any(|marker| lower.contains(marker));
+        let event = (index, line.chars().take(420).collect::<String>());
+        if is_critical {
+            critical.push(event);
+        } else {
+            routine.push(event);
+        }
     }
-    events
+
+    let remaining = max_events.saturating_sub(critical.len());
+    let mut selected = critical;
+    selected.extend(routine.into_iter().rev().take(remaining));
+    selected.sort_by_key(|(index, _)| *index);
+    if selected.len() > max_events {
+        selected = selected.split_off(selected.len() - max_events);
+    }
+    selected.into_iter().map(|(_, event)| event).collect()
+}
+
+fn parse_kscreen_outputs(input: &str) -> Result<Vec<KScreenOutput>, serde_json::Error> {
+    let root: serde_json::Value = serde_json::from_str(input)?;
+    let outputs = root
+        .get("outputs")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    Ok(outputs
+        .iter()
+        .take(8)
+        .map(|output| {
+            let current_mode_id = output
+                .get("currentModeId")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            let mode = output
+                .get("modes")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|modes| {
+                    modes.iter().find(|mode| {
+                        mode.get("id").and_then(serde_json::Value::as_str) == Some(current_mode_id)
+                    })
+                })
+                .and_then(|mode| mode.get("name"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown")
+                .to_owned();
+            let size = output.get("size");
+            let position = output.get("pos");
+            KScreenOutput {
+                name: output
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_owned(),
+                connected: output
+                    .get("connected")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
+                enabled: output
+                    .get("enabled")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
+                mode,
+                width: size
+                    .and_then(|value| value.get("width"))
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0),
+                height: size
+                    .and_then(|value| value.get("height"))
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0),
+                x: position
+                    .and_then(|value| value.get("x"))
+                    .and_then(serde_json::Value::as_i64)
+                    .unwrap_or(0),
+                y: position
+                    .and_then(|value| value.get("y"))
+                    .and_then(serde_json::Value::as_i64)
+                    .unwrap_or(0),
+            }
+        })
+        .collect())
+}
+
+fn read_kscreen_outputs() -> io::Result<Vec<KScreenOutput>> {
+    let output = Command::new("kscreen-doctor").arg("-j").output()?;
+    if !output.status.success() {
+        return Err(io::Error::other(format!(
+            "kscreen-doctor exited with status {}",
+            output.status
+        )));
+    }
+    parse_kscreen_outputs(&String::from_utf8_lossy(&output.stdout))
+        .map_err(|error| io::Error::other(format!("invalid KScreen JSON: {error}")))
+}
+
+fn read_kscreen_dpms() -> io::Result<String> {
+    let output = Command::new("kscreen-doctor")
+        .args(["--dpms", "show"])
+        .output()?;
+    if !output.status.success() {
+        return Err(io::Error::other(format!(
+            "kscreen-doctor --dpms show exited with status {}",
+            output.status
+        )));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .take(8)
+        .map(|line| line.chars().take(200).collect::<String>())
+        .collect::<Vec<_>>()
+        .join("; "))
 }
 
 fn read_graphics_session_events(boot: &str) -> io::Result<Vec<String>> {
-    const PATTERN: &str = "EGL|GLX|atomic commit|failed to commit|pageflip|swapchain|graphics buffer|GPU process|GPU reset|main thread was hanging|QSGTexture|segfault|core dumped|drkonqi|renderer process gone|compositor|no outputs|placeholder screen|unexisting screen|org_kde_powerdevil|i915 gmbus";
-    let filtered = Command::new("journalctl")
-        .args([
-            "--user",
-            "-b",
-            boot,
-            "--no-pager",
-            "-o",
-            "short-iso",
-            "--grep",
-            PATTERN,
-            "--case-sensitive=no",
-            "-n",
-            "80",
-        ])
-        .output()?;
-    if filtered.status.success() {
-        return Ok(parse_graphics_events(
-            &String::from_utf8_lossy(&filtered.stdout),
-            40,
-        ));
+    const CRITICAL_PATTERN: &str = "atomic commit failed|failed to allocate a graphics buffer|swapchain|no outputs|placeholder screen|GPU reset|main thread was hanging|segfault|core dumped";
+    const ROUTINE_PATTERN: &str = "EGL|GLX|pageflip|compositor|unexisting screen|org_kde_powerdevil|i915 gmbus|prop_subsystem:  drm";
+
+    let query = |pattern: &str, limit: &str| {
+        Command::new("journalctl")
+            .args([
+                "--user",
+                "-b",
+                boot,
+                "--no-pager",
+                "-o",
+                "short-iso",
+                "--grep",
+                pattern,
+                "--case-sensitive=no",
+                "-n",
+                limit,
+            ])
+            .output()
+    };
+
+    let critical = query(CRITICAL_PATTERN, "80")?;
+    let routine = query(ROUTINE_PATTERN, "12")?;
+    if critical.status.success() || routine.status.success() {
+        let mut combined = String::from_utf8_lossy(&critical.stdout).into_owned();
+        combined.push('\n');
+        combined.push_str(&String::from_utf8_lossy(&routine.stdout));
+        return Ok(parse_graphics_events(&combined, 40));
     }
 
+    // Older systemd versions may not support --grep; fall back to a bounded tail.
     let fallback = Command::new("journalctl")
         .args([
             "--user",
@@ -1848,6 +2040,18 @@ mod tests {
     }
 
     #[test]
+    fn parses_kscreen_runtime_output_state_and_current_mode() {
+        let json = r#"{"outputs":[{"name":"eDP-1","connected":true,"enabled":true,"currentModeId":"1","modes":[{"id":"1","name":"1366x768@60"}],"size":{"width":1366,"height":768},"pos":{"x":0,"y":0}}]}"#;
+        let outputs = parse_kscreen_outputs(json).unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].name, "eDP-1");
+        assert!(outputs[0].connected);
+        assert!(outputs[0].enabled);
+        assert_eq!(outputs[0].mode, "1366x768@60");
+        assert_eq!((outputs[0].width, outputs[0].height), (1366, 768));
+    }
+
+    #[test]
     fn drm_connector_name_filter_excludes_cards_and_render_nodes() {
         assert!(is_drm_connector_name("card1-eDP-1"));
         assert!(is_drm_connector_name("card1-HDMI-A-1"));
@@ -1863,6 +2067,24 @@ mod tests {
         assert_eq!(parsed.len(), 2);
         assert!(parsed[0].contains("atomic commit failed"));
         assert!(parsed[1].contains("EGL Driver message"));
+    }
+
+    #[test]
+    fn graphics_event_filter_prioritizes_atomic_failures_over_repeated_screen_warnings() {
+        let mut input = String::from("kwin_wayland: Atomic commit failed: EACCESS\n");
+        for index in 0..60 {
+            input.push_str(&format!(
+                "2026-11-15T15:52:{index:02} archlinux plasmashell[920]: requesting unexisting screen geometry 0\n"
+            ));
+        }
+        let parsed = parse_graphics_events(&input, 2);
+        assert_eq!(parsed.len(), 2);
+        assert!(
+            parsed
+                .iter()
+                .any(|line| line.contains("Atomic commit failed"))
+        );
+        assert!(parsed.iter().any(|line| line.contains("unexisting screen")));
     }
 
     #[test]

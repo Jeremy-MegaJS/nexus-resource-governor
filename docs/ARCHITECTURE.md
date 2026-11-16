@@ -136,7 +136,7 @@ A hard cgroup memory limit can trigger OOM handling inside a workload. It is an 
 - memory.swap.current and memory.swap.max where available.
 - /proc/pressure/memory, /proc/pressure/cpu, and /proc/pressure/io.
 - /proc/meminfo, /proc/vmstat, selected bounded /proc/interrupts counters, and zram sysfs statistics.
-- DRM device/driver identity, bounded display-connector status/mode inventory, and thermal-zone readings from sysfs. These are diagnostic signals, not GPU engine utilization or GPU-hang detection.
+- DRM device/driver identity, bounded display-connector status/mode inventory, KScreen userspace output state and DPMS mode, and thermal-zone readings. These are diagnostic signals, not GPU engine utilization or GPU-hang detection.
 - Process metadata and systemd user-slice hierarchy. The read-only process sample exposes both executable basename and a bounded (512-character) `/proc/PID/exe` target path as identity hints; neither is treated as a unique application identity. Command-line arguments are intentionally not collected because they may contain secrets.
 - A bounded --diagnose report filters relevant kernel and user-session journal events from the current and three preceding boots, including KWin/Plasma, XWayland/EGL, DRM, IRQ, ACPI, thermal, and storage messages. Journal access is optional; unavailable logs are reported as unavailable, not interpreted as clean.
 

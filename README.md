@@ -97,7 +97,7 @@ The first implementation is a read-only Rust CLI. It currently samples:
 - Physical memory and swap from /proc/meminfo.
 - Memory, CPU, and I/O PSI from /proc/pressure.
 - Bounded interrupt counters for IRQ 27 and selected graphics/storage/input drivers.
-- DRM device/driver identity, connector status/modes, and thermal-zone readings from sysfs (no GPU engine utilization claim).
+- DRM device/driver identity, connector status/modes, KScreen userspace output state and DPMS mode, and thermal-zone readings (no GPU engine utilization claim).
 - Filtered, bounded kernel and user-session journal events from the current boot and three preceding boots, including KWin/Plasma/XWayland/EGL messages when journal access is available.
 - ZRAM compression and physical-memory accounting from sysfs.
 - Selected paging and reclaim counters from /proc/vmstat.
