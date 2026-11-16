@@ -468,7 +468,8 @@ impl Snapshot {
                     for event in &events {
                         let lower = event.to_ascii_lowercase();
                         desktop_reported_no_outputs |= lower.contains("there are no outputs")
-                            || lower.contains("placeholder screen");
+                            || lower.contains("placeholder screen")
+                            || lower.contains("unexisting screen");
                         swapchain_allocation_failures |=
                             lower.contains("failed to allocate a graphics buffer for a swapchain");
                     }
@@ -612,10 +613,18 @@ fn is_relevant_kernel_event(line: &str) -> bool {
     MARKERS.iter().any(|marker| lower.contains(marker))
 }
 
+fn journal_message_signature(line: &str) -> &str {
+    line.rsplit_once("]: ")
+        .map(|(_, message)| message)
+        .unwrap_or(line)
+}
+
 fn parse_kernel_events(input: &str, max_events: usize) -> Vec<String> {
+    let mut seen = std::collections::BTreeSet::new();
     let mut events: Vec<String> = input
         .lines()
         .filter(|line| is_relevant_kernel_event(line))
+        .filter(|line| seen.insert(journal_message_signature(line).to_owned()))
         .map(|line| line.chars().take(420).collect())
         .collect();
     if events.len() > max_events {
@@ -703,9 +712,11 @@ fn is_relevant_graphics_event(line: &str) -> bool {
 }
 
 fn parse_graphics_events(input: &str, max_events: usize) -> Vec<String> {
+    let mut seen = std::collections::BTreeSet::new();
     let mut events: Vec<String> = input
         .lines()
         .filter(|line| is_relevant_graphics_event(line))
+        .filter(|line| seen.insert(journal_message_signature(line).to_owned()))
         .map(|line| line.chars().take(420).collect())
         .collect();
     if events.len() > max_events {
@@ -1852,6 +1863,13 @@ mod tests {
         assert_eq!(parsed.len(), 2);
         assert!(parsed[0].contains("atomic commit failed"));
         assert!(parsed[1].contains("EGL Driver message"));
+    }
+
+    #[test]
+    fn graphics_event_filter_deduplicates_repeated_screen_geometry_warnings() {
+        let input = "2026-11-15T15:52:44 archlinux plasmashell[920]: requesting unexisting screen geometry 0\n2026-11-15T15:52:45 archlinux plasmashell[920]: requesting unexisting screen geometry 0\n";
+        let parsed = parse_graphics_events(input, 8);
+        assert_eq!(parsed.len(), 1);
     }
 
     #[test]
