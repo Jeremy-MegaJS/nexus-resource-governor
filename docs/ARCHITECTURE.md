@@ -1,6 +1,6 @@
 # Nexus Resource Governor — Architecture
 
-**Status:** Proposed architecture. Enforcement remains disabled until the relevant backend is implemented and tested.
+**Status:** Proposed architecture. General-purpose enforcement remains disabled; the limited reversible Linux Gaming Session subset is implemented and tested.
 
 ## 1. Product boundary
 
@@ -285,3 +285,20 @@ The desktop presentation keeps four primary circular gauges and a compact second
 ### Independent hardware telemetry
 
 The desktop no longer queries KSystemStats or KDE's sensor D-Bus service. It reads per-core CPU counters from /proc/stat, hwmon sensors from /sys/class/hwmon, GPU identity/GT frequency/RC6 residency from DRM sysfs, disk counters from /sys/block, per-interface counters from /sys/class/net, addresses from ip -j address, and battery state from /sys/class/power_supply. Unsupported metrics remain unknown. Intel RC6-derived GPU activity is explicitly an estimate, not a direct engine-busy measurement. Per-core CPU and GPU history is session-scoped in the GUI; RAM/PSI/workload telemetry remains persisted by the background service.
+
+
+## 10. Reversible Gaming Session controller (implemented Linux subset)
+
+NRG Desktop has an opt-in controller for an already-running game inside a systemd user application scope. The first profiles are Cloud Gaming, Native Gaming, and Emulation. The controller captures effective CPUWeight/IOWeight values before applying temporary systemd user-unit properties. The selected game receives higher scheduling weights; other running application scopes receive lower weights. KWin, PipeWire, WirePlumber, accessibility/polkit, and RDC units are explicitly protected with elevated weights; chat/browser workloads remain at or below normal priority. KDE Baloo indexing is stopped only if it was active at session start. The performance power profile is selected only when AC power is present and the captured profile differs.
+
+The transaction is stored with private permissions under ~/.local/state/nrg/gaming-session.json. A transient systemd user timer invokes the same restoration routine after the selected TTL, independently of the desktop process. Manual restore uses the same path. The controller restores captured effective weights even if a unit stopped during the session, preventing runtime properties from leaking into its next activation. Failed restores retain the transaction for retry.
+
+This is a deliberately limited enforcement surface:
+- No arbitrary process freezing, SIGSTOP, SIGKILL, or generic application suspension.
+- No memory.high/memory.max enforcement or memory reservation.
+- No kernel, IRQ, USB, driver, DNS, MTU, WARP, or qdisc changes.
+- No claim of per-process network attribution or traffic shaping.
+- A 10-second ping probe reports rolling latency, approximate jitter, and packet loss; it is diagnostic and not game-server telemetry.
+- systemd CPU/I/O weights are relative scheduling priorities, not reserved CPU capacity or guaranteed frame rates.
+
+The controller requires a running systemd user manager and supported systemd cgroup-v2 controls. If the target game is not found in an active application scope, it refuses to start rather than guessing a process identity.

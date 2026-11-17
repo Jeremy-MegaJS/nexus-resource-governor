@@ -1,6 +1,6 @@
 # Nexus Resource Governor — Roadmap
 
-The project currently has a read-only Linux telemetry backend and a policy/Rescue Mode simulator. Controlled enforcement, the desktop UI, and the Windows backend are not implemented. The order prioritizes trustworthy measurement and safe recovery before enforcement.
+The project has a Linux telemetry backend, policy/Rescue Mode simulator, early desktop UI, and a limited opt-in reversible Gaming Session controller. General-purpose enforcement and the Windows backend remain unimplemented. The roadmap prioritizes trustworthy measurement and safe recovery before expanding enforcement.
 
 ## Phase 0 — Requirements and architecture
 - [x] Define Linux-first, Windows-planned strategy.
@@ -60,7 +60,9 @@ The project currently has a read-only Linux telemetry backend and a policy/Rescu
 
 ## Phase 3 — Linux controlled enforcement
 - [ ] Create managed workload scopes.
-- [ ] Add reversible CPU and I/O prioritization.
+- [x] Add an opt-in, expiring systemd-user Gaming Session with captured CPUWeight/IOWeight values, protected desktop/audio/RDC services, temporary Baloo pause, and timer-driven rollback.
+- [x] Add rolling gaming-path ping, jitter, and loss telemetry in NRG Desktop.
+- [ ] Add reversible CPU and I/O prioritization for general per-app policies outside Gaming Session.
 - [ ] Add memory.high support with explicit opt-in and rollback.
 - [ ] Add optional hard ceilings only after safety testing.
 - [ ] Implement action ownership, expiry, crash recovery, and audit log.
@@ -74,7 +76,8 @@ The project currently has a read-only Linux telemetry backend and a policy/Rescu
 - [ ] System tray integration.
 - [ ] Per-application budgets and profiles.
 - [ ] Clear explanations and confirmation prompts.
-- [ ] Temporary overrides and one-click restoration.
+- [x] Temporary Gaming Session overrides with timer-driven and manual restoration.
+- [ ] General per-workload temporary overrides and one-click restoration.
 - [x] Add English/Spanish UI language selection.
 - [x] Add editable named coaster profiles with ordered application-name priority fragments; Rust planner consumes the saved priorities.
 - [x] Add exposed dedicated-GPU-memory telemetry and aggregate physical-interface network throughput.
@@ -99,6 +102,7 @@ The project currently has a read-only Linux telemetry backend and a policy/Rescu
 - [ ] Add package ownership, complete process-tree growth correlation, per-cgroup network counters, per-process GPU/network attribution, full app-group lifecycle tracking, connection/persistence context, without collecting command-line arguments or secrets.
 - [ ] Implement safe, capability-checked cgroup memory.high enforcement with explicit approval, expiry, audit, and rollback.
 - [ ] Implement per-workload network shaping using a validated cgroup-v2/eBPF or equivalent backend, with explicit approval and rollback.
+- [x] Add a bounded, low-rate external latency probe for Gaming Mode; it reports path quality but does not shape traffic.
 
 ## Phase 5 — Windows backend
 - [ ] Implement Windows telemetry provider.

@@ -2,6 +2,7 @@
 """NRG Desktop: resource monitoring, guarded process management, and diagnostics."""
 from __future__ import annotations
 import configparser, json, os, pwd, re, signal, shutil, subprocess, sys, time, urllib.request, platform, socket
+import nrg_gaming
 from pathlib import Path
 from PySide6.QtCore import Qt, QProcess, QTimer, QThread, Signal, QPointF
 from PySide6.QtGui import QFont, QColor, QPainter, QPen, QPolygonF, QIcon
@@ -639,7 +640,7 @@ class NRGWindow(QMainWindow):
         self.tabs.setUsesScrollButtons(True)
         self.tabs.currentChanged.connect(lambda index: self.refresh_history() if index == 4 else None)
         root.addWidget(self.tabs)
-        self._dashboard(); self._hardware_tab(); self._process_tab(); self._applications_tab(); self._history_tab(); self._diagnostics_tab()
+        self._dashboard(); self._hardware_tab(); self._process_tab(); self._applications_tab(); self._history_tab(); self._gaming_tab(); self._diagnostics_tab()
         self.language_box.currentIndexChanged.connect(self.change_language)
         self.language = self.language_box.currentData() or "en"
         page_scroll = QScrollArea()
@@ -831,6 +832,188 @@ class NRGWindow(QMainWindow):
         self.history_note = QLabel("RAM / PSI / workload history is stored by the NRG service. CPU per-core and GPU history is session-only while this window is open.")
         self.history_note.setObjectName("muted"); layout.addWidget(self.history_note)
         self.tabs.addTab(page,"History")
+
+    def _gaming_tab(self):
+        page, layout = QWidget(), QVBoxLayout()
+        page.setLayout(layout)
+        heading = QLabel("Gaming Session · temporary resource policy")
+        heading.setObjectName("section")
+        layout.addWidget(heading)
+        self.gaming_status = QLabel("No gaming session active")
+        self.gaming_status.setObjectName("section")
+        layout.addWidget(self.gaming_status)
+
+        controls = QHBoxLayout()
+        self.gaming_mode_box = QComboBox()
+        self.gaming_mode_box.addItem("Cloud Gaming · GeForce NOW", "cloud")
+        self.gaming_mode_box.addItem("Native Gaming · Steam / Lutris", "native")
+        self.gaming_mode_box.addItem("Emulation · RetroArch / emulators", "emulation")
+        self.gaming_duration_box = QComboBox()
+        self.gaming_duration_box.addItem("30 minutes", 30)
+        self.gaming_duration_box.addItem("60 minutes", 60)
+        self.gaming_duration_box.addItem("120 minutes", 120)
+        self.gaming_duration_box.setCurrentIndex(1)
+        self.gaming_start_button = QPushButton("Start Gaming Session")
+        self.gaming_start_button.clicked.connect(self.start_gaming_session)
+        self.gaming_restore_button = QPushButton("Restore original settings")
+        self.gaming_restore_button.clicked.connect(self.restore_gaming_session)
+        controls.addWidget(self.gaming_mode_box, 2)
+        controls.addWidget(self.gaming_duration_box)
+        controls.addWidget(self.gaming_start_button)
+        controls.addWidget(self.gaming_restore_button)
+        layout.addLayout(controls)
+
+        self.gaming_details = QLabel(
+            "Cloud profile: GeForce NOW gets higher CPU / disk-I/O weight. Other application scopes yield scheduling priority. "
+            "KDE Baloo indexing pauses temporarily. KWin, audio, accessibility and RDC receive protection; chat/browser workloads yield priority. "
+            "A systemd timer restores the captured settings even if NRG Desktop closes.")
+        self.gaming_details.setWordWrap(True)
+        layout.addWidget(self.gaming_details)
+
+        self.gaming_network = QLabel("Network quality: collecting first probe…")
+        self.gaming_network.setObjectName("section")
+        layout.addWidget(self.gaming_network)
+        self.gaming_network_note = QLabel(
+            "NRG monitors end-to-end ping, jitter and packet loss. It does not change DNS, MTU, Wi-Fi drivers, WARP or queue disciplines. "
+            "Traffic shaping is withheld until the bottleneck and safe upload/download ceiling are measured.")
+        self.gaming_network_note.setWordWrap(True)
+        self.gaming_network_note.setObjectName("muted")
+        layout.addWidget(self.gaming_network_note)
+
+        self.gaming_recommendations = QLabel(
+            "GeForce NOW starting point: 1280×720, stream at 60 FPS, 8–12 Mbps bitrate, competitive / low-latency mode if available. "
+            "Reduce bitrate further if packet loss or jitter rises. The 50 FPS goal is a target, not a guarantee: NRG cannot control NVIDIA's server FPS.")
+        self.gaming_recommendations.setWordWrap(True)
+        layout.addWidget(self.gaming_recommendations)
+
+        self.gaming_safety = QLabel(
+            "Safety boundary: no process is killed or frozen in this first controller. Background apps are deprioritized, not suspended; "
+            "the indexer is stopped only if it was running. No IRQ, USB, kernel, or network-stack changes.")
+        self.gaming_safety.setWordWrap(True)
+        self.gaming_safety.setObjectName("muted")
+        layout.addWidget(self.gaming_safety)
+        layout.addStretch()
+        self.tabs.addTab(page, "Gaming")
+
+        self.gaming_process = None
+        self.gaming_action = None
+        self.network_probe_process = QProcess(self)
+        self.network_probe_process.finished.connect(self.network_probe_finished)
+        self.network_probe_timer = QTimer(self)
+        self.network_probe_timer.timeout.connect(self.probe_network_latency)
+        self.network_probe_timer.start(10_000)
+        self.network_probe_samples = []
+        self.gaming_status_timer = QTimer(self)
+        self.gaming_status_timer.timeout.connect(self.refresh_gaming_status)
+        self.gaming_status_timer.start(10_000)
+        self.refresh_gaming_status()
+        self.probe_network_latency()
+
+    def refresh_gaming_status(self):
+        state = nrg_gaming.session_status()
+        if state.get("active"):
+            remaining = int(state.get("remaining_seconds", 0))
+            minutes, seconds = divmod(remaining, 60)
+            self.gaming_status.setText(
+                f"ACTIVE · {state.get('mode', 'unknown').upper()} · {state.get('target', 'unknown')} · "
+                f"rollback in {minutes:02d}:{seconds:02d}")
+            self.gaming_restore_button.setEnabled(True)
+            self.gaming_start_button.setText("Restart Gaming Session")
+        else:
+            self.gaming_status.setText("No gaming session active · original settings")
+            self.gaming_restore_button.setEnabled(False)
+            self.gaming_start_button.setText("Start Gaming Session")
+
+    def start_gaming_session(self):
+        if self.gaming_process and self.gaming_process.state() != QProcess.ProcessState.NotRunning:
+            return
+        mode = self.gaming_mode_box.currentData()
+        minutes = int(self.gaming_duration_box.currentData())
+        answer = QMessageBox.warning(
+            self, "Start temporary Gaming Session",
+            f"Apply reversible scheduling priorities for {minutes} minutes? "
+            "The selected game must already be running. A systemd timer will restore settings automatically.",
+            QMessageBox.StandardButton.Cancel | QMessageBox.StandardButton.Yes,
+            QMessageBox.StandardButton.Yes)
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self.run_gaming_action("start", [mode, str(minutes)])
+
+    def restore_gaming_session(self):
+        if self.gaming_process and self.gaming_process.state() != QProcess.ProcessState.NotRunning:
+            return
+        answer = QMessageBox.question(
+            self, "Restore Gaming Session",
+            "Restore the original CPU / I/O priorities and resume services paused by NRG?",
+            QMessageBox.StandardButton.Cancel | QMessageBox.StandardButton.Yes,
+            QMessageBox.StandardButton.Yes)
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self.run_gaming_action("restore", [])
+
+    def run_gaming_action(self, action, args):
+        self.gaming_action = action
+        self.gaming_start_button.setEnabled(False)
+        self.gaming_restore_button.setEnabled(False)
+        self.gaming_status.setText("Applying reversible session policy…" if action == "start" else "Restoring original settings…")
+        self.gaming_process = QProcess(self)
+        self.gaming_process.finished.connect(self.gaming_action_finished)
+        script = str(Path(__file__).with_name("nrg_gaming.py"))
+        command = ["--start", *args] if action == "start" else ["--restore"]
+        self.gaming_process.start(sys.executable, [script, *command])
+
+    def gaming_action_finished(self, code, status):
+        output = bytes(self.gaming_process.readAllStandardOutput()).decode(errors="replace")
+        errors = bytes(self.gaming_process.readAllStandardError()).decode(errors="replace")
+        self.gaming_start_button.setEnabled(True)
+        self.gaming_restore_button.setEnabled(True)
+        try:
+            result = json.loads(output) if output.strip() else {}
+        except ValueError:
+            result = {}
+        if code == 0 and result.get("ok", True):
+            self.gaming_status.setText(result.get("message", "Gaming policy updated."))
+            details = []
+            if result.get("target"):
+                details.append("Game: " + result["target"])
+            if result.get("prioritized_units"):
+                details.append("Protected: " + ", ".join(result["prioritized_units"]))
+            if result.get("deprioritized_units"):
+                details.append("Background: " + ", ".join(result["deprioritized_units"]))
+            if result.get("baloo_paused"):
+                details.append("Baloo indexing paused")
+            if result.get("power_profile"):
+                details.append("Power profile: " + str(result["power_profile"]))
+            if details:
+                self.gaming_details.setText("\n".join(details))
+        else:
+            self.gaming_status.setText("Gaming policy failed · no unverified changes assumed")
+            QMessageBox.warning(self, "NRG Gaming Mode", errors or result.get("error", output or "Unknown error"))
+        self.refresh_gaming_status()
+
+    def probe_network_latency(self):
+        if not hasattr(self, "network_probe_process"):
+            return
+        if self.network_probe_process.state() != QProcess.ProcessState.NotRunning:
+            return
+        self.network_probe_process.start("ping", ["-n", "-c", "1", "-W", "1", "1.1.1.1"])
+
+    def network_probe_finished(self, code, status):
+        raw = bytes(self.network_probe_process.readAllStandardOutput()).decode(errors="replace")
+        match = re.search(r"time[=<]([0-9.]+)\s*ms", raw)
+        self.network_probe_samples.append(float(match.group(1)) if code == 0 and match else None)
+        self.network_probe_samples = self.network_probe_samples[-12:]
+        good = [sample for sample in self.network_probe_samples if sample is not None]
+        loss = 100 * (len(self.network_probe_samples) - len(good)) / max(1, len(self.network_probe_samples))
+        jitter = (sum(abs(b - a) for a, b in zip(good, good[1:])) / (len(good) - 1)) if len(good) > 1 else None
+        if good:
+            latency = f"{good[-1]:.1f} ms"
+            jitter_text = f"{jitter:.1f} ms" if jitter is not None else "collecting"
+        else:
+            latency, jitter_text = "unreachable", "—"
+        self.gaming_network.setText(
+            f"Internet probe · 1.1.1.1: {latency} · jitter {jitter_text} · loss {loss:.0f}% "
+            f"({len(self.network_probe_samples)} samples)")
 
     def _diagnostics_tab(self):
         page, layout = QWidget(), QVBoxLayout(); page.setLayout(layout)
@@ -1748,7 +1931,24 @@ class NRGWindow(QMainWindow):
         self.tabs.setTabText(2, tr("Processes", "Procesos"))
         self.tabs.setTabText(3, tr("Applications", "Aplicaciones"))
         self.tabs.setTabText(4, tr("History", "Historial"))
-        self.tabs.setTabText(5, tr("Diagnosis & Profiles", "Diagnóstico y perfiles"))
+        self.tabs.setTabText(5, tr("Gaming", "Juegos"))
+        self.tabs.setTabText(6, tr("Diagnosis & Profiles", "Diagnóstico y perfiles"))
+        self.gaming_start_button.setText(tr("Start Gaming Session", "Iniciar sesión de juego"))
+        self.gaming_restore_button.setText(tr("Restore original settings", "Restaurar configuración original"))
+        self.gaming_mode_box.setItemText(0, tr("Cloud Gaming · GeForce NOW", "Juego en la nube · GeForce NOW"))
+        self.gaming_mode_box.setItemText(1, tr("Native Gaming · Steam / Lutris", "Juegos nativos · Steam / Lutris"))
+        self.gaming_mode_box.setItemText(2, tr("Emulation · RetroArch / emulators", "Emulación · RetroArch / emuladores"))
+        for index, minutes in enumerate((30, 60, 120)):
+            self.gaming_duration_box.setItemText(index, tr(f"{minutes} minutes", f"{minutes} minutos"))
+        self.gaming_network_note.setText(tr(
+            "NRG monitors end-to-end ping, jitter and packet loss. It does not change DNS, MTU, Wi-Fi drivers, WARP or queue disciplines. Traffic shaping is withheld until the bottleneck and safe upload/download ceiling are measured.",
+            "NRG monitoriza ping, jitter y pérdida de paquetes de extremo a extremo. No cambia DNS, MTU, controladores Wi-Fi, WARP ni disciplinas de cola. El control de tráfico queda pendiente hasta medir el cuello de botella y los límites seguros de subida/descarga."))
+        self.gaming_recommendations.setText(tr(
+            "GeForce NOW starting point: 1280×720, stream at 60 FPS, 8–12 Mbps bitrate, competitive / low-latency mode if available. Reduce bitrate further if packet loss or jitter rises. The 50 FPS goal is a target, not a guarantee: NRG cannot control NVIDIA's server FPS.",
+            "Punto de partida para GeForce NOW: 1280×720, stream a 60 FPS y bitrate de 8–12 Mbps; modo competitivo / baja latencia si está disponible. Reduce más el bitrate si aumenta la pérdida o el jitter. Los 50 FPS son un objetivo, no una garantía: NRG no controla los FPS del servidor de NVIDIA."))
+        self.gaming_safety.setText(tr(
+            "Safety boundary: no process is killed or frozen in this first controller. Background apps are deprioritized, not suspended; the indexer is stopped only if it was running. No IRQ, USB, kernel, or network-stack changes.",
+            "Límite de seguridad: este primer controlador no mata ni congela procesos. Las aplicaciones secundarias pierden prioridad, no se suspenden; el indexador solo se detiene si estaba activo. No se cambian IRQ, USB, kernel ni la pila de red."))
         titles = {
             "available": ("RAM AVAILABLE", "RAM DISPONIBLE"),
             "used": ("RAM IN USE", "RAM EN USO"),
@@ -1791,7 +1991,8 @@ class NRGWindow(QMainWindow):
         self.tabs.setTabText(2, tr("Processes", "Procesos"))
         self.tabs.setTabText(3, tr("Applications", "Aplicaciones"))
         self.tabs.setTabText(4, tr("History", "Historial"))
-        self.tabs.setTabText(5, tr("Diagnosis & Profiles", "Diagnóstico y perfiles"))
+        self.tabs.setTabText(5, tr("Gaming", "Juegos"))
+        self.tabs.setTabText(6, tr("Diagnosis & Profiles", "Diagnóstico y perfiles"))
         self.hardware_summary.setText(tr("Live hardware inventory · kernel interfaces", "Inventario de hardware en vivo · interfaces del kernel"))
         self.hardware_note.setText(tr(
             "Metrics are read directly from Linux /proc, /sys, hwmon and network interfaces. Intel i915 GPU activity is estimated from RC6 idle residency, not measured engine busy; integrated graphics share system RAM rather than dedicated VRAM. Unsupported values are shown as unavailable.",
@@ -2033,6 +2234,25 @@ class NRGWindow(QMainWindow):
         err=bytes(self.diag_process.readAllStandardError()).decode(errors="replace")
         self.diag_output.setPlainText(raw+("\n\nERRORS:\n"+err if err else ""))
 
+
+    def closeEvent(self, event):
+        for timer_name in ("timer", "history_timer", "network_probe_timer", "gaming_status_timer"):
+            timer = getattr(self, timer_name, None)
+            if timer:
+                timer.stop()
+        probe = getattr(self, "network_probe_process", None)
+        if probe and probe.state() != QProcess.ProcessState.NotRunning:
+            probe.terminate()
+            if not probe.waitForFinished(500):
+                probe.kill()
+                probe.waitForFinished(500)
+        worker = getattr(self, "network_worker", None)
+        if worker and worker.isRunning():
+            worker.wait(1000)
+        gaming = getattr(self, "gaming_process", None)
+        if gaming and gaming.state() != QProcess.ProcessState.NotRunning:
+            gaming.waitForFinished(5000)
+        event.accept()
 
 def main():
     if "--self-test" in sys.argv:
